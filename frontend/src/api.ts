@@ -293,4 +293,38 @@ export const tenantsApi = {
   ) => apiClient.put(`/tenants/${id}`, data),
 };
 
+// ========== Emails API ==========
+export const emailsApi = {
+  getList: (params?: {
+    page?: number;
+    page_size?: number;
+    buyer_mail_number_search?: string;
+    store_name_search?: string;
+    sort_by?: string;
+    sort_order?: string;
+  }) => {
+    const filteredParams: any = {};
+    if (params) {
+      Object.entries(params).forEach(([key, value]) => {
+        if (value !== undefined && value !== null && value !== "") {
+          filteredParams[key] = value;
+        }
+      });
+    }
+    return apiClient.get("/emails/", { params: filteredParams });
+  },
+  getById: (id: string) => apiClient.get(`/emails/${id}`),
+  updateFollowUp: (id: string, follow_up_status: number) => 
+    apiClient.put(`/emails/${id}/follow-up`, { follow_up_status }),
+  updateNeedReply: (id: string, need_reply: number, reply_text?: string) => 
+    apiClient.put(`/emails/${id}/need-reply`, { need_reply, reply_text }),
+  getStoreNames: () => apiClient.get("/emails/store-names"),
+  getUnfollowedCount: () => apiClient.get("/emails/unfollowed-count"),
+  aiReply: (id: string, requirements: string) =>
+    apiClient.post(`/emails/${id}/ai-reply`, { requirements }, { timeout: 180000 }),
+  batchUpdateFollowUp: (email_ids: string[], follow_up_status: number) =>
+    apiClient.put('/emails/batch/follow-up', { email_ids, follow_up_status }),
+  getDepartmentTodos: () => apiClient.get('/emails/department-todos'),
+};
+
 export default apiClient;

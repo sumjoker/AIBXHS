@@ -7,6 +7,7 @@ import ChatBot from './pages/ChatBot'
 import Dashboard from './pages/Dashboard'
 import InventoryBot from './pages/InventoryBot'
 import ReviewBot from './pages/ReviewBot'
+import EmailBot from './pages/EmailBot'
 import OrgManagement from './pages/OrgManagement'
 import StoreManagement from './pages/StoreManagement'
 import ProductManagement from './pages/ProductManagement'
@@ -24,6 +25,16 @@ function AppRoutes() {
         element={
           <ProtectedRoute>
             <MainLayout>
+              <Dashboard />
+            </MainLayout>
+          </ProtectedRoute>
+        } 
+      />
+      <Route 
+        path="/todo" 
+        element={
+          <ProtectedRoute>
+            <MainLayout>
               <Home />
             </MainLayout>
           </ProtectedRoute>
@@ -35,16 +46,6 @@ function AppRoutes() {
           <ProtectedRoute>
             <MainLayout>
               <ChatBot />
-            </MainLayout>
-          </ProtectedRoute>
-        } 
-      />
-      <Route 
-        path="/dashboard" 
-        element={
-          <ProtectedRoute>
-            <MainLayout>
-              <Dashboard />
             </MainLayout>
           </ProtectedRoute>
         } 
@@ -65,6 +66,16 @@ function AppRoutes() {
           <ProtectedRoute>
             <MainLayout>
               <ReviewBot />
+            </MainLayout>
+          </ProtectedRoute>
+        } 
+      />
+      <Route 
+        path="/email" 
+        element={
+          <ProtectedRoute>
+            <MainLayout>
+              <EmailBot />
             </MainLayout>
           </ProtectedRoute>
         } 

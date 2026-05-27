@@ -13,10 +13,12 @@ import {
   Settings,
   Key,
   BarChart3,
+  ClipboardList,
   Store,
   ShoppingBag,
   Users,
   Building2,
+  Mail,
 } from 'lucide-react'
 import { useAuth } from '../../contexts/AuthContext'
 import { useTheme } from '../../contexts/ThemeContext'
@@ -59,7 +61,7 @@ const MainLayout: React.FC<MainLayoutProps> = ({ children }) => {
   const [notifOpen, setNotifOpen] = useState(false)
   const [selectedNotification, setSelectedNotification] = useState<Notification | null>(null)
   const [detailModalOpen, setDetailModalOpen] = useState(false)
-  const pollRef = useRef<NodeJS.Timeout | null>(null)
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
   const isAdmin = user?.role === 'admin'
 
@@ -164,14 +166,14 @@ const MainLayout: React.FC<MainLayoutProps> = ({ children }) => {
       label: '首页',
     },
     {
+      key: '/todo',
+      icon: <ClipboardList size={20} />,
+      label: '待办事项',
+    },
+    {
       key: '/chat',
       icon: <Bot size={20} />,
       label: 'AI聊天助手',
-    },
-    {
-      key: '/dashboard',
-      icon: <BarChart3 size={20} />,
-      label: '数据看板',
     },
     {
       key: '/inventory',
@@ -182,6 +184,11 @@ const MainLayout: React.FC<MainLayoutProps> = ({ children }) => {
       key: '/review',
       icon: <MessageSquare size={20} />,
       label: '差评机器人',
+    },
+    {
+      key: '/email',
+      icon: <Mail size={20} />,
+      label: '邮件机器人',
     },
     ...(isAdmin
       ? [
@@ -212,10 +219,11 @@ const MainLayout: React.FC<MainLayoutProps> = ({ children }) => {
   const getPageTitle = () => {
     const pathMap: Record<string, string> = {
       '/': '首页',
+      '/todo': '待办事项',
       '/chat': 'AI聊天助手',
-      '/dashboard': '数据看板',
       '/inventory': '库存机器人',
       '/review': '差评机器人',
+      '/email': '邮件机器人',
       '/org': '角色管理',
       '/stores': '店铺管理',
       '/products': '产品管理',
