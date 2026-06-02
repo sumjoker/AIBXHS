@@ -66,6 +66,8 @@ def init_db():
         from models.review import Review, ReviewAnalysis, ReviewHandling
         from models.conversation import ConversationHistory
         from models.department import Department, UserDepartment
+        from models.restock import InventorySnapshot, InboundShipmentDetail, ReplenishmentDecision
+        from models.local_inventory import LocalInventory
         
         # 创建所有表
         Base.metadata.create_all(bind=engine)

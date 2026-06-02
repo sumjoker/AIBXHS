@@ -3,7 +3,7 @@ import { Card, Row, Col, Typography, Select, Empty } from 'antd'
 import { MessageSquare, Package, Bot, ChevronRight, Mail } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
 import { useAuth } from '../contexts/AuthContext'
-import { reviewsApi, emailsApi } from '../api'
+import { reviewsApi, notificationsApi, inventoryApi,emailsApi } from '../api'
 
 const { Title, Text } = Typography
 
@@ -19,6 +19,8 @@ const Home: React.FC = () => {
   const navigate = useNavigate()
   const { user } = useAuth()
   const [reviews, setReviews] = useState<ReviewItem[]>([])
+  const [notifications, setNotifications] = useState<Notification[]>([])
+  const [inventoryStats, setInventoryStats] = useState<{ red: number; yellow: number; green: number } | null>(null)
   const [loading, setLoading] = useState(true)
   const [emailStats, setEmailStats] = useState<{ urgent: number; medium: number; normal: number; total: number }>({ urgent: 0, medium: 0, normal: 0, total: 0 })
   const [filterBot, setFilterBot] = useState<string | undefined>(undefined)
@@ -49,9 +51,10 @@ const Home: React.FC = () => {
   const fetchData = async () => {
     try {
       setLoading(true)
-      const [reviewsRes, emailCountRes] = await Promise.all([
+      const [reviewsRes, inventoryRes, emailCountRes] = await Promise.all([
         reviewsApi.getList({ page_size: 100 }),
-        emailsApi.getUnfollowedCount()
+        emailsApi.getUnfollowedCount(),
+        inventoryApi.getOverview()
       ])
 
       if (reviewsRes.data.success) {
@@ -67,6 +70,9 @@ const Home: React.FC = () => {
 
       if (emailCountRes.data.success) {
         setEmailStats(emailCountRes.data.data)
+      if (inventoryRes.data.success) {
+        const d = inventoryRes.data.data
+        setInventoryStats({ red: d.red_count || 0, yellow: d.yellow_count || 0, green: d.green_count || 0 })
       }
     } catch (error) {
       console.error('获取数据失败:', error)
@@ -109,9 +115,10 @@ const Home: React.FC = () => {
       color: '#faad14',
       description: '实时监控库存，智能预警提醒',
       path: '/inventory',
-      stats: null,
-      hasPending: false,
-      priority: 3,
+      // stats: null,
+      // hasPending: false,
+      // priority: 3,
+      stats: inventoryStats
     },
     {
       id: 'chat',
@@ -177,7 +184,8 @@ const Home: React.FC = () => {
     )
   }
 
-  const renderEmailStats = () => {
+ const renderEmailStats = () => {
+    
     return (
       <div style={{ marginTop: 16 }}>
         <Row gutter={[8, 8]}>
@@ -197,6 +205,33 @@ const Home: React.FC = () => {
             <div style={{ textAlign: 'center', padding: '8px 0', background: '#e6f7ff', borderRadius: 8 }}>
               <div style={{ fontSize: 12, color: '#999', marginBottom: 4 }}>一般</div>
               <div style={{ fontSize: 20, fontWeight: 'bold', color: '#1890ff' }}>{emailStats.normal}</div>
+            </div>
+          </Col>
+        </Row>
+      </div>
+    )
+  }
+    
+  const renderInventoryStats = (stats: any) => {
+    return (
+      <div style={{ marginTop: 16 }}>
+        <Row gutter={[8, 8]}>
+          <Col span={8}>
+            <div style={{ textAlign: 'center', padding: '8px 0', background: '#fff2f0', borderRadius: 8 }}>
+              <div style={{ fontSize: 12, color: '#999', marginBottom: 4 }}>断货风险</div>
+              <div style={{ fontSize: 20, fontWeight: 'bold', color: '#cf1322' }}>{stats.red}</div>
+            </div>
+          </Col>
+          <Col span={8}>
+            <div style={{ textAlign: 'center', padding: '8px 0', background: '#fffbe6', borderRadius: 8 }}>
+              <div style={{ fontSize: 12, color: '#999', marginBottom: 4 }}>库存预警</div>
+              <div style={{ fontSize: 20, fontWeight: 'bold', color: '#faad14' }}>{stats.yellow}</div>
+            </div>
+          </Col>
+          <Col span={8}>
+            <div style={{ textAlign: 'center', padding: '8px 0', background: '#f6ffed', borderRadius: 8 }}>
+              <div style={{ fontSize: 12, color: '#999', marginBottom: 4 }}>库存正常</div>
+              <div style={{ fontSize: 20, fontWeight: 'bold', color: '#52c41a' }}>{stats.green}</div>
             </div>
           </Col>
         </Row>
@@ -262,6 +297,8 @@ const Home: React.FC = () => {
 
                 {module.stats && module.stats !== 'email' && renderReviewStats(module.stats)}
                 {module.stats === 'email' && renderEmailStats()}
+                {module.id === 'review' && module.stats && renderReviewStats(module.stats)}
+                {module.id === 'inventory' && module.stats && renderInventoryStats(module.stats)}
               </Card>
             </Col>
             ))

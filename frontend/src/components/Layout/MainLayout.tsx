@@ -212,6 +212,11 @@ const MainLayout: React.FC<MainLayoutProps> = ({ children }) => {
             icon: <Building2 size={20} />,
             label: '租户管理',
           },
+          {
+            key: '/business-settings',
+            icon: <Settings size={20} />,
+            label: '业务设置',
+          },
         ]
       : []),
   ]
@@ -222,6 +227,7 @@ const MainLayout: React.FC<MainLayoutProps> = ({ children }) => {
       '/todo': '待办事项',
       '/chat': 'AI聊天助手',
       '/inventory': '库存机器人',
+      '/business-settings': '业务设置',
       '/review': '差评机器人',
       '/email': '邮件机器人',
       '/org': '角色管理',
@@ -341,7 +347,7 @@ const MainLayout: React.FC<MainLayoutProps> = ({ children }) => {
           } as React.CSSProperties}
         />
       </Sider>
-      <Layout style={{ height: '100%', display: 'flex', flexDirection: 'column' }}>
+      <Layout style={{ height: '100%', display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
         <Header style={{ padding: '0 24px', background: colorBgContainer, display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexShrink: 0, height: 64 }}>
           <Title level={4} style={{ margin: 0 }}>{getPageTitle()}</Title>
           <div style={{ display: 'flex', alignItems: 'center', gap: '16px' }}>

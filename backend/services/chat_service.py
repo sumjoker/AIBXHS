@@ -56,6 +56,106 @@ DATE_PARSING_TOOLS = [
     }
 ]
 
+# 库存查询工具
+INVENTORY_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "query_inventory_status",
+            "description": "查询库存状态，可按风险等级、补货需求等条件筛选。支持查询：断货风险商品、需要补货的商品、库存正常商品等。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query_type": {
+                        "type": "string",
+                        "enum": ["stockout_risk", "need_restock", "low_stock", "all"],
+                        "description": "查询类型：stockout_risk=断货风险商品，need_restock=需要补货的商品，low_stock=低库存商品，all=全部库存"
+                    },
+                    "risk_level": {
+                        "type": "string",
+                        "enum": ["red", "yellow", "green"],
+                        "description": "风险等级筛选：red=断货风险，yellow=库存预警，green=库存正常"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "返回数量限制，默认10条",
+                        "default": 10
+                    }
+                },
+                "required": ["query_type"]
+            }
+        }
+    }
+]
+
+# 合并所有工具
+ALL_TOOLS = DATE_PARSING_TOOLS + INVENTORY_TOOLS
+
+
+def query_inventory_status(db: Session, query_type: str, risk_level: str = None, limit: int = 10) -> List[Dict[str, Any]]:
+    """查询库存状态"""
+    try:
+        from models.restock import InventorySnapshot, ReplenishmentDecision
+        from sqlalchemy import func
+
+        # 获取最新快照日期
+        latest = db.query(func.max(InventorySnapshot.snapshot_date)).scalar()
+        if not latest:
+            return []
+
+        # 构建基础查询
+        query = db.query(InventorySnapshot, ReplenishmentDecision).outerjoin(
+            ReplenishmentDecision,
+            (ReplenishmentDecision.snapshot_id == InventorySnapshot.id) &
+            (ReplenishmentDecision.snapshot_date == latest)
+        ).filter(
+            InventorySnapshot.snapshot_date == latest,
+            (InventorySnapshot.summary_flag != "共享库存") | (InventorySnapshot.summary_flag.is_(None))
+        )
+
+        # 根据查询类型筛选
+        if query_type == "stockout_risk":
+            query = query.filter(ReplenishmentDecision.risk_level == "红")
+            query = query.order_by(ReplenishmentDecision.days_of_supply.asc())
+        elif query_type == "need_restock":
+            query = query.filter(ReplenishmentDecision.suggest_qty > 0)
+            query = query.order_by(ReplenishmentDecision.suggest_qty.desc())
+        elif query_type == "low_stock":
+            query = query.filter(ReplenishmentDecision.days_of_supply <= 60)
+            query = query.order_by(ReplenishmentDecision.days_of_supply.asc())
+        elif risk_level:
+            risk_map = {"red": "红", "yellow": "黄", "green": "绿"}
+            query = query.filter(ReplenishmentDecision.risk_level == risk_map.get(risk_level, risk_level))
+
+        results = query.limit(limit).all()
+
+        items = []
+        for snap, dec in results:
+            items.append({
+                "asin": snap.asin or "",
+                "sku": snap.sku or "",
+                "product_name": snap.product_name or snap.asin or "未知商品",
+                "account": snap.account or "",
+                "country": snap.country or "",
+                "fba_stock": int(snap.fba_stock) if snap.fba_stock else 0,
+                "fba_available": int(snap.fba_available) if snap.fba_available else 0,
+                "fba_inbound": int(snap.fba_inbound) if snap.fba_inbound else 0,
+                "daily_sales": round(float(snap.daily_sales), 1) if snap.daily_sales else 0,
+                "days_of_supply": round(float(dec.days_of_supply), 1) if dec and dec.days_of_supply else 0,
+                "suggest_qty": int(dec.suggest_qty) if dec and dec.suggest_qty else 0,
+                "risk_level": dec.risk_level if dec else "绿",
+                "stockout_date": dec.stockout_date_calc if dec else "-",
+                "reason": dec.reason if dec else "",
+            })
+
+        return items
+
+    except Exception as e:
+        logger.error(f"查询库存状态失败: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return []
+
 
 def query_negative_reviews(db: Session, start_date: str, end_date: str, asin: Optional[str] = None) -> List[Dict[str, Any]]:
     """查询差评工具函数 - 使用纯SQL避免Enum问题"""
@@ -497,8 +597,8 @@ def batch_analyze_reviews(db: Session, review_ids: List[int]) -> List[Dict[str, 
     return results
 
 
-def save_message(db: Session, user_id: int, session_id: str, role: str, content: str, function_name: Optional[str] = None):
-    message = ConversationHistory(user_id=user_id, session_id=session_id, role=role, content=content, function_name=function_name)
+def save_message(db: Session, user_id: int, session_id: str, role: str, content: str, function_name: Optional[str] = None, chat_type: str = "review"):
+    message = ConversationHistory(user_id=user_id, session_id=session_id, role=role, content=content, function_name=function_name, chat_type=chat_type)
     db.add(message)
     db.commit()
     db.refresh(message)
@@ -510,18 +610,34 @@ def get_conversation_history(db: Session, user_id: int, session_id: str, limit: 
     return [{"role": m.role, "content": m.content} for m in messages if m.role in ["system", "user", "assistant"]]
 
 
-def process_chat(db: Session, user_id: int, session_id: str, user_message: str) -> str:
-    """处理聊天请求 - 使用商品名，自动保存分析结果"""
-    logger.debug(f"[CHAT] 收到消息, 用户={user_id}")
+def process_chat(db: Session, user_id: int, session_id: str, user_message: str, chat_type: str = "review") -> str:
+    """处理聊天请求 - chat_type: review=差评分析, inventory=库存分析"""
+    logger.debug(f"[CHAT] 收到消息, 用户={user_id}, 类型={chat_type}")
 
     if not client:
         return "OpenAI API Key 未配置"
 
-    save_message(db, user_id, session_id, "user", user_message)
+    save_message(db, user_id, session_id, "user", user_message, chat_type=chat_type)
     history = get_conversation_history(db, user_id, session_id, limit=10)
     current_date = datetime.now().strftime("%Y-%m-%d")
 
-    system_prompt = f"""你是专业的跨境电商差评分析助手。当前日期: {current_date}。
+    # 根据对话类型选择不同的提示词和工具
+    if chat_type == "inventory":
+        system_prompt = f"""你是专业的跨境电商库存分析助手。当前日期: {current_date}。
+
+你的能力：
+- 查询库存状态、断货风险商品、补货建议
+- 分析库存健康度，给出补货优先级建议
+
+重要规则：
+- 使用商品的【真实名称】来引用产品，不要只使用ASIN
+- 回复要简洁专业，突出关键数据和建议
+- 优先展示风险等级和建议补货数量
+- 对于库存数据，用表格或列表形式清晰展示
+"""
+        tools = INVENTORY_TOOLS
+    else:
+        system_prompt = f"""你是专业的跨境电商差评分析助手。当前日期: {current_date}。
 
 任务：
 1. 解析用户提到的日期范围
@@ -533,29 +649,66 @@ def process_chat(db: Session, user_id: int, session_id: str, user_message: str) 
 - 必须使用商品的【真实名称】来引用产品
 - 引用格式：【商品名】具体问题描述
 """
+        tools = DATE_PARSING_TOOLS
 
     messages = [{"role": "system", "content": system_prompt}]
     messages.extend(history)
     messages.append({"role": "user", "content": user_message})
 
     try:
-        response = client.chat.completions.create(model=settings.OPENAI_MODEL, messages=messages, tools=DATE_PARSING_TOOLS, tool_choice="auto", timeout=180)
+        response = client.chat.completions.create(model=settings.OPENAI_MODEL, messages=messages, tools=tools, tool_choice="auto", timeout=180)
 
         assistant_message = response.choices[0].message
 
         if assistant_message.tool_calls:
             for tool_call in assistant_message.tool_calls:
+                # 处理库存查询
+                if tool_call.function.name == "query_inventory_status":
+                    args = json.loads(tool_call.function.arguments)
+                    query_type = args.get("query_type", "all")
+                    risk_level = args.get("risk_level")
+                    limit = args.get("limit", 10)
+
+                    logger.info(f"[CHAT] 库存查询: type={query_type}, risk={risk_level}, limit={limit}")
+                    inventory_items = query_inventory_status(db, query_type, risk_level, limit)
+                    logger.info(f"[CHAT] 查询到 {len(inventory_items)} 条库存数据")
+
+                    # 构建给AI的数据
+                    inventory_prompt = f"""当前日期: {current_date}
+
+查询到 {len(inventory_items)} 条库存数据：
+
+{json.dumps(inventory_items, ensure_ascii=False, indent=1)}
+
+请基于以上数据进行专业的库存分析，给出：
+1. 整体库存状况概述
+2. 重点关注商品列表（按风险等级排序）
+3. 补货建议
+
+回复要简洁专业，使用商品名称而非ASIN。"""
+
+                    final_messages = [{"role": "system", "content": inventory_prompt}]
+                    final_messages.extend(history)
+                    final_messages.append({"role": "user", "content": user_message})
+
+                    final_response = client.chat.completions.create(model=settings.OPENAI_MODEL, messages=final_messages, temperature=0.7, timeout=240)
+                    final_reply = final_response.choices[0].message.content or "抱歉，无法处理"
+
+                    save_message(db, user_id, session_id, "assistant", final_reply, chat_type=chat_type)
+                    return final_reply
+
+                # 处理日期解析（差评查询）
                 if tool_call.function.name == "parse_date_range":
                     args = json.loads(tool_call.function.arguments)
                     # 添加健壮性检查
                     start_date = args.get("start_date")
                     end_date = args.get("end_date")
-                    
+
                     # 如果AI没有正确返回日期，重新调用AI要求明确日期
                     if not start_date or not end_date:
                         logger.warning(f"[CHAT] AI未正确返回日期，重新要求明确日期")
                         # 保存当前消息
-                        save_message(db, user_id, session_id, "assistant", assistant_message.content or "")
+                        save_message(db, user_id, session_id, "assistant", assistant_message.content or "", chat_type=chat_type)
                         # 重新发送明确要求
                         clarify_prompt = """请务必调用parse_date_range工具，并明确返回：
 - start_date: YYYY-MM-DD格式的开始日期
@@ -645,11 +798,11 @@ def process_chat(db: Session, user_id: int, session_id: str, user_message: str) 
                     final_response = client.chat.completions.create(model=settings.OPENAI_MODEL, messages=final_messages, temperature=0.7, timeout=240)
                     final_reply = final_response.choices[0].message.content or "抱歉，无法处理"
                     
-                    save_message(db, user_id, session_id, "assistant", final_reply)
+                    save_message(db, user_id, session_id, "assistant", final_reply, chat_type=chat_type)
                     return final_reply
         else:
             reply = assistant_message.content or "请说明想查看的日期范围"
-            save_message(db, user_id, session_id, "assistant", reply)
+            save_message(db, user_id, session_id, "assistant", reply, chat_type=chat_type)
             return reply
 
     except Exception as e:

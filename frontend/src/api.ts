@@ -100,7 +100,10 @@ export const inventoryApi = {
 
   // ========== Restock (补货) API ==========
   getOverview: () => apiClient.get("/restock/overview"),
-  calculate: () => apiClient.post("/restock/calculate"),
+  calculate: (params?: { snapshot_ids?: string }) =>
+    apiClient.post("/restock/calculate", params),
+  getCalculateStatus: (taskId: string) =>
+    apiClient.get(`/restock/calculate/status/${taskId}`),
   import: (file: File) => {
     const formData = new FormData();
     formData.append("file", file);
@@ -114,6 +117,52 @@ export const inventoryApi = {
   getInboundDetails: (asin: string, account?: string) =>
     apiClient.get("/restock/inbound-details", { params: { asin, account } }),
   getLatestDate: () => apiClient.get("/restock/latest-date"),
+  getFilterOptions: () => apiClient.get("/restock/filter-options"),
+  exportInventory: (params?: {
+    keyword?: string;
+    risk_level?: string[];
+    account?: string[];
+    country?: string[];
+    fields?: string[];
+  }) => {
+    const searchParams = new URLSearchParams();
+    if (params?.keyword) searchParams.append('keyword', params.keyword);
+    if (params?.risk_level) params.risk_level.forEach(r => searchParams.append('risk_level', r));
+    if (params?.account) params.account.forEach(a => searchParams.append('account', a));
+    if (params?.country) params.country.forEach(c => searchParams.append('country', c));
+    if (params?.fields) params.fields.forEach(f => searchParams.append('fields', f));
+    return apiClient.get(`/restock/export?${searchParams.toString()}`, { responseType: 'blob' });
+  },
+  syncFeishuInbound: () => apiClient.post("/restock/sync-feishu-inbound"),
+  getSyncFeishuStatus: () => apiClient.get("/restock/sync-feishu-status"),
+  updateInspectionQuantity: (snapshotId: number, quantity: number) =>
+    apiClient.put("/restock/inspection-quantity", null, { params: { snapshot_id: snapshotId, inspection_quantity: quantity } }),
+  getSummaryChildren: (asin: string) =>
+    apiClient.get("/restock/summary-children", { params: { asin } }),
+};
+
+// ========== Local Inventory API ==========
+export const localInventoryApi = {
+  import: (file: File) => {
+    const formData = new FormData();
+    formData.append("file", file);
+    return apiClient.post("/local-inventory/import", formData, {
+      headers: { "Content-Type": "multipart/form-data" },
+    });
+  },
+  getSummary: () => apiClient.get("/local-inventory/summary"),
+  getList: (params?: { keyword?: string; page?: number; page_size?: number }) =>
+    apiClient.get("/local-inventory/list", { params }),
+  clear: () => apiClient.delete("/local-inventory/clear"),
+  importReduction: (country: string, file: File) => {
+    const formData = new FormData();
+    formData.append("file", file);
+    return apiClient.post(`/local-inventory/import-reduction?country=${encodeURIComponent(country)}`, formData, {
+      headers: { "Content-Type": "multipart/form-data" },
+    });
+  },
+  downloadReductionResult: (fileId: string) =>
+    apiClient.get(`/local-inventory/import-reduction/result/${fileId}`, { responseType: 'blob' }),
 };
 
 // ========== Reviews API ==========
@@ -190,15 +239,43 @@ export const notificationsApi = {
 
 // ========== Chat API ==========
 export const chatApi = {
-  sendMessage: (message: string, sessionId?: string) =>
+  sendMessage: (message: string, sessionId?: string, chatType: string = "review") =>
     apiClient.post(
       "/chat",
-      { message, session_id: sessionId },
+      { message, session_id: sessionId, chat_type: chatType },
       { timeout: 300000 },
     ),
-  getSessions: () => apiClient.get("/chat/sessions"),
+  getSessions: (chatType?: string) =>
+    apiClient.get("/chat/sessions", { params: chatType ? { chat_type: chatType } : {} }),
   getSessionMessages: (sessionId: string) =>
     apiClient.get(`/chat/sessions/${sessionId}/messages`),
+
+  deleteSession: (sessionId: string) =>
+    apiClient.delete(`/chat/sessions/${sessionId}`)
+};
+
+// ========== Chat API (Streaming) ==========
+export const chatStreamApi = {
+  sendMessage: async (
+    message: string,
+    sessionId?: string,
+    chatType: string = "review"
+  ): Promise<Response> => {
+    return fetch('/api/chat/stream', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${localStorage.getItem('token') || ''}`
+      },
+      body: JSON.stringify({ message, session_id: sessionId, chat_type: chatType })
+    });
+  },
+
+  searchSessions: (query: string, chatType?: string, limit?: number) =>
+    apiClient.post("/chat/search", { query, chat_type: chatType, limit }),
+
+  exportSession: (sessionId: string, format: 'markdown' | 'json' | 'txt' = 'markdown') =>
+    apiClient.post("/chat/export", { session_id: sessionId, format }, { responseType: 'text' })
 };
 
 // ========== Stores API ==========
@@ -325,6 +402,38 @@ export const emailsApi = {
   batchUpdateFollowUp: (email_ids: string[], follow_up_status: number) =>
     apiClient.put('/emails/batch/follow-up', { email_ids, follow_up_status }),
   getDepartmentTodos: () => apiClient.get('/emails/department-todos'),
+// ========== Business Settings API ==========
+export interface FormulaWeight {
+  period: string;
+  label: string;
+  weight: number;
+}
+
+export interface DailySalesConfig {
+  type: string;
+  weights: FormulaWeight[];
+}
+
+export interface BusinessSetting {
+  id: number;
+  setting_type: string;
+  setting_name: string;
+  formula_config: DailySalesConfig;
+  is_active: number;
+}
+
+export const businessSettingsApi = {
+  getSetting: (settingType: string) =>
+    apiClient.get<BusinessSetting>(`/business-settings/${settingType}`),
+
+  listSettings: () =>
+    apiClient.get<BusinessSetting[]>("/business-settings/"),
+
+  updateSetting: (settingType: string, data: { formula_config: DailySalesConfig; is_active?: number }) =>
+    apiClient.put<BusinessSetting>(`/business-settings/${settingType}`, data),
+
+  resetSetting: (settingType: string) =>
+    apiClient.post<BusinessSetting>(`/business-settings/reset/${settingType}`),
 };
 
 export default apiClient;

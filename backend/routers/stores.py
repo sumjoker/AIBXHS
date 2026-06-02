@@ -78,7 +78,7 @@ async def get_stores(
         
         query = text(f"""
             SELECT s.id, s.name, s.platform, s.site, s.status, 
-                   s.department_id, d.name as department_name, s.created_at
+                   s.department_id, d.name as department_name, s.inventory_name, s.created_at
             FROM stores s
             LEFT JOIN departments d ON s.department_id = d.id
             WHERE {where_clause}
@@ -99,7 +99,8 @@ async def get_stores(
                 "status": row[4],
                 "department_id": row[5],
                 "department_name": row[6] or "未分配",
-                "created_at": row[7].strftime("%Y-%m-%d %H:%M:%S") if row[7] else "",
+                "inventory_name": row[7] or "",
+                "created_at": row[8].strftime("%Y-%m-%d %H:%M:%S") if row[8] else "",
             })
         return {"success": True, "data": stores, "total": total}
     except Exception as e:

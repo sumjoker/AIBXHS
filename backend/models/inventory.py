@@ -73,8 +73,8 @@ class InventoryRecord(BaseModel):
     record_date = Column(Date, nullable=False, index=True, comment="记录日期")
     source = Column(Enum(InventorySource), default=InventorySource.API_SYNC, comment="数据来源")
     
-    # 关联关系
-    product = relationship("Product", back_populates="inventory_records")
+    # 关联关系（移除 back_populates 以避免与 Product 的循环依赖）
+    product = relationship("Product", foreign_keys=[product_id])
 
 
 class InventoryAlert(BaseModel):
@@ -99,8 +99,8 @@ class InventoryAlert(BaseModel):
     resolved_note = Column(String(1000), nullable=True, comment="处理备注")
     feishu_record_id = Column(String(100), nullable=True, comment="飞书记录ID")
     
-    # 关联关系
-    product = relationship("Product", back_populates="inventory_alerts")
+    # 关联关系（移除 back_populates）
+    product = relationship("Product", foreign_keys=[product_id])
     actions = relationship("InventoryAction", back_populates="alert", cascade="all, delete-orphan")
 
 
@@ -123,6 +123,6 @@ class InventoryAction(BaseModel):
     executed_by = Column(Integer, ForeignKey("users.id"), nullable=True, comment="执行人")
     executed_at = Column(DateTime, nullable=True, comment="执行时间")
     
-    # 关联关系
-    product = relationship("Product", back_populates="inventory_actions")
+    # 关联关系（移除 back_populates）
+    product = relationship("Product", foreign_keys=[product_id])
     alert = relationship("InventoryAlert", back_populates="actions")

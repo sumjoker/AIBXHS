@@ -31,16 +31,16 @@ class InventorySnapshot(BaseModel):
     # 补货状态
     replenishment_status = Column(String(50), comment="补货状态")
 
-    # 时间参数（天数）
-    purchase_plan_days = Column(Integer, comment="采购计划天数")
-    purchase_lead_time = Column(Integer, comment="采购交期")
-    qc_days = Column(Integer, comment="质检天数")
-    overseas_to_fba_days = Column(Integer, comment="海外仓至FBA天数")
-    safety_days = Column(Integer, comment="安全天数")
-    purchase_frequency = Column(Integer, comment="采购频率")
-    local_ship_frequency = Column(Integer, comment="本地仓发货频率")
-    overseas_ship_frequency = Column(Integer, comment="海外仓发货频率")
-    stock_up_duration = Column(Integer, comment="备货时长")
+    # 时间参数（天数）- 采购配置字段，Excel导入时不写入，保留字段供未来使用
+    purchase_plan_days = Column(Integer, comment="采购计划天数（Excel不导入）")
+    purchase_lead_time = Column(Integer, comment="采购交期（Excel不导入）")
+    qc_days = Column(Integer, comment="质检天数（Excel不导入）")
+    overseas_to_fba_days = Column(Integer, comment="海外仓至FBA天数（Excel不导入）")
+    safety_days = Column(Integer, comment="安全天数（Excel不导入）")
+    purchase_frequency = Column(Integer, comment="采购频率（Excel不导入）")
+    local_ship_frequency = Column(Integer, comment="本地仓发货频率（Excel不导入）")
+    overseas_ship_frequency = Column(Integer, comment="海外仓发货频率（Excel不导入）")
+    stock_up_duration = Column(Integer, default=100, comment="备货时长（固定100天，Excel不导入）")
 
     # 销量数据
     sales_3d = Column(Float, comment="3天销量")
@@ -78,7 +78,8 @@ class InventorySnapshot(BaseModel):
     fba_inbound_processing = Column(Float, comment="入库中")
 
     # 本地与总库存
-    local_available = Column(Float, comment="本地可用")
+    local_inventory = Column(Integer, default=0, comment="本地仓库存")
+    inspection_quantity = Column(Integer, default=0, comment="查验货件数量")
     total_stock = Column(Float, comment="总库存")
 
     # 库龄分布
@@ -87,6 +88,7 @@ class InventorySnapshot(BaseModel):
     age_6_9 = Column(Float, comment="6-9个月库龄")
     age_9_12 = Column(Float, comment="9-12个月库龄")
     age_12_plus = Column(Float, comment="12个月以上库龄")
+    gross_margin = Column(Float, comment="毛利率参考")
 
 
 class InboundShipmentDetail(BaseModel):
@@ -107,6 +109,7 @@ class InboundShipmentDetail(BaseModel):
     transport_method = Column(String(100), comment="运输方式")
     ship_date = Column(Date, nullable=True, comment="发货时间")
     estimated_available_date = Column(Date, nullable=True, comment="预计可售时间")
+    estimated_arrival_date = Column(Date, nullable=True, comment="预计到港时间")
     raw_text = Column(Text, comment="原始行文本")
 
 

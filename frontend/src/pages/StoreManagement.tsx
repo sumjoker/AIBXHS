@@ -13,6 +13,7 @@ interface Store {
   status: string
   department_id: number | null
   department_name: string
+  inventory_name: string | null
   created_at: string
 }
 
@@ -171,6 +172,7 @@ const StoreManagement: React.FC = () => {
 
   const columns = [
     { title: '店铺名称', dataIndex: 'name', key: 'name' },
+    { title: '店铺', dataIndex: 'inventory_name', key: 'inventory_name' },
     {
       title: '平台',
       dataIndex: 'platform',

@@ -1,3 +1,4 @@
+from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy.orm import Session
@@ -5,6 +6,7 @@ from database.database import get_db
 from services.auth_service import authenticate_user, create_user, create_access_token, get_password_hash, verify_password
 from dependencies import get_current_user
 from models.user import User
+from typing import Optional
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
@@ -13,7 +15,7 @@ class UserRegister(BaseModel):
     username: str
     email: EmailStr
     password: str
-    nickname: str | None = None
+    nickname: Optional[str] = None
 
 
 class UserLogin(BaseModel):
@@ -30,7 +32,7 @@ class UserResponse(BaseModel):
     id: int
     username: str
     email: str
-    nickname: str | None
+    nickname: Optional[str]
     role: str
 
 
