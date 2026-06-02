@@ -24,6 +24,12 @@ body {
   overflow: hidden;
 }
 
+/* 防止页面级水平滚动条 */
+.ant-layout,
+.ant-layout-content {
+  overflow-x: hidden;
+}
+
 code {
   font-family:
     source-code-pro, Menlo, Monaco, Consolas, "Courier New", monospace;

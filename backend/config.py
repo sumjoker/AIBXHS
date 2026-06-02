@@ -14,6 +14,14 @@ class Settings(BaseSettings):
     DB_USER: str = "root"
     DB_PASSWORD: str = "Root@123456"
     DB_NAME: str = "baoxinhuasheng"
+
+    # Demo 模式配置
+    DEMO_MODE: bool = False
+    DEMO_DB_HOST: str = "localhost"
+    DEMO_DB_PORT: int = 3306
+    DEMO_DB_USER: str = "root"
+    DEMO_DB_PASSWORD: str = "123456"
+    DEMO_DB_NAME: str = "bxhs_ai_assistance_demo"
     
     # 飞书配置
     FEISHU_APP_ID: str = ""
@@ -35,10 +43,21 @@ class Settings(BaseSettings):
     
     @property
     def DATABASE_URL(self) -> str:
-        """构建数据库连接URL"""
-        # URL编码密码，处理特殊字符
-        encoded_password = urllib.parse.quote_plus(self.DB_PASSWORD)
-        return f"mysql+pymysql://{self.DB_USER}:{encoded_password}@{self.DB_HOST}:{self.DB_PORT}/{self.DB_NAME}?charset=utf8mb4"
+        """构建数据库连接URL，DEMO_MODE=true 时连接本地 Demo 库"""
+        if self.DEMO_MODE:
+            host = self.DEMO_DB_HOST
+            port = self.DEMO_DB_PORT
+            user = self.DEMO_DB_USER
+            pwd = self.DEMO_DB_PASSWORD
+            db = self.DEMO_DB_NAME
+        else:
+            host = self.DB_HOST
+            port = self.DB_PORT
+            user = self.DB_USER
+            pwd = self.DB_PASSWORD
+            db = self.DB_NAME
+        encoded_password = urllib.parse.quote_plus(pwd)
+        return f"mysql+pymysql://{user}:{encoded_password}@{host}:{port}/{db}?charset=utf8mb4"
     
     class Config:
         env_file = os.path.join(os.path.dirname(__file__), ".env")

@@ -57,7 +57,8 @@ class Review(BaseModel):
 
     # 关联关系
     tenant = relationship("Tenant", back_populates="reviews")
-    store = relationship("Store", back_populates="reviews")
+    # Store 已简化，移除 back_populates
+    store = relationship("Store", foreign_keys=[store_id])
     analysis = relationship("ReviewAnalysis", back_populates="review", uselist=False, cascade="all, delete-orphan")
     handlings = relationship("ReviewHandling", back_populates="review", cascade="all, delete-orphan")
 

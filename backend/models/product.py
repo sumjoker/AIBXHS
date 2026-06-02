@@ -33,10 +33,8 @@ class Product(BaseModel):
     
     # 关联关系
     tenant = relationship("Tenant", back_populates="products")
-    store = relationship("Store", back_populates="products")
-    inventory_records = relationship("InventoryRecord", back_populates="product", cascade="all, delete-orphan")
-    inventory_alerts = relationship("InventoryAlert", back_populates="product", cascade="all, delete-orphan")
-    inventory_actions = relationship("InventoryAction", back_populates="product", cascade="all, delete-orphan")
+    # Store 可能没有 products relationship，使用 foreign_keys 指定外键
+    store = relationship("Store", foreign_keys=[store_id])
 
     # 唯一约束
     __table_args__ = (
