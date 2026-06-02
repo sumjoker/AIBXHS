@@ -24,3 +24,23 @@ Thumbs.db
 *.log
 npm-debug.log*
 __pycache__/
+
+# Data files
+*.xlsx
+*.csv
+*.png
+*.jpg
+*.jpeg
+
+# Backup files
+backup_*.csv
+
+# Docs & artifacts
+docs/
+.trae/documents/
+.trae/specs/
+
+# Python
+*.pyc
+*.pyo
+.pytest_cache/
