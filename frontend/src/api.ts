@@ -402,6 +402,8 @@ export const emailsApi = {
   batchUpdateFollowUp: (email_ids: string[], follow_up_status: number) =>
     apiClient.put('/emails/batch/follow-up', { email_ids, follow_up_status }),
   getDepartmentTodos: () => apiClient.get('/emails/department-todos'),
+};
+
 // ========== Business Settings API ==========
 export interface FormulaWeight {
   period: string;

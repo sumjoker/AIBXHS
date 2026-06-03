@@ -70,6 +70,7 @@ const Home: React.FC = () => {
 
       if (emailCountRes.data.success) {
         setEmailStats(emailCountRes.data.data)
+      }
       if (inventoryRes.data.success) {
         const d = inventoryRes.data.data
         setInventoryStats({ red: d.red_count || 0, yellow: d.yellow_count || 0, green: d.green_count || 0 })
