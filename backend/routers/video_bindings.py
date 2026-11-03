@@ -121,7 +121,9 @@ class VideoBindingReject(BaseModel):
 async def submit_video_binding(
     body: VideoBindingSubmit,
     db: Session = Depends(get_db),
-    current_user: User = Depends(PermissionChecker("ai_video:use")),
+    # 任一媒体权限即可提交：生图权限的人也要能把生成的图绑到产品上，
+    # 否则「有生图权限但没视频权限」的角色（美工）生成完无法落地。审核仍走 ai_video:approve。
+    current_user: User = Depends(PermissionChecker("ai_video:use", "ai_image:use")),
 ):
     """提交「绑定至产品」审核申请（AI视频 / 高清处理 / AI生图），审核通过后才真正绑定"""
     media_url = body.video_url.strip()

@@ -21,6 +21,7 @@ import json
 import logging
 import re
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional
 
@@ -130,6 +131,30 @@ SHOT_SPECS: Dict[str, str] = {
         "frame, details still readable on a small screen. All inventory pieces present."
     ),
 }
+
+# 品牌A+横幅（970×300）：与商品图完全不同的设计目标——画面只有品牌名艺术字，
+# 参考图仅用于提取风格。走独立的指令模板，不与商品图的 inventory 流程混用。
+BANNER_DESIGN_INSTRUCTION = """You are a senior brand designer and prompt engineer for the image-edit model Nano Banana 2 (Gemini image), working for {platform} in {market}.
+
+You will receive ONE reference photo of a product. This task is NOT a product shot: design a 970x300 (about 3.2:1) brand banner whose ONLY content is the brand name rendered as artistic lettering.
+
+STEP 1 — Extract style from the reference photo ONLY: dominant colours, accent colours, material texture, pattern motifs, decorative elements, overall mood. Do NOT copy the product, its packaging, people, text or logos from the photo, and do not keep the photo's composition.
+
+STEP 2 — Design the banner around the brand name "{brand_name}":
+- The brand name is the ONLY text allowed in the frame. Render EVERY letter as hand-crafted artistic lettering: per-letter shapes, stroke weight and curves, joins and breaks, serifs or cuts, baseline play, decorative flourishes drawn from the product's style. It must look like custom lettering designed by a human, NOT a plain system font and NOT a rigid geometric block.
+- The word must be spelled exactly "{brand_name}", case-sensitive, no letters added, dropped or redesigned beyond recognition.
+- Letterforms may intertwine with decorative background elements, but the word stays perfectly readable.
+- Brand name width about 65-75% of the frame width; you decide the exact size and position for beauty. Decorations support it from the edges or weave around it and must not reduce readability.
+- No product, no packaging, no people, and no other text, letters or numbers anywhere.
+
+STEP 3 — Reply with a single JSON object, no markdown fence, no explanation:
+{{
+  "prompt_en": "60-110 words describing: background palette and gradient, decorative motifs and where they sit, the lettering style of each letter (stroke, joins, flourishes), light and mood. Must state that the exact brand name '{brand_name}' is the only text.",
+  "prompt_cn": "a concise simplified-Chinese translation of prompt_en",
+  "negative": "product, packaging, person, hands, extra text, letters, numbers, watermark, logo, price tag"
+}}
+Output nothing outside the JSON.
+"""
 
 DESIGN_INSTRUCTION = """You are a senior e-commerce product photographer and prompt engineer for the image-edit model Nano Banana 2 (Gemini image), working for {platform} in {market}.
 
@@ -269,6 +294,9 @@ def design_shot_prompt(
     brand_genes: str = "",
     prepared: Optional[bytes] = None,
     variation: Optional[Dict[str, str]] = None,
+    layout_bytes: Optional[bytes] = None,
+    layout_hint: str = "",
+    brand_name: str = "",
 ) -> Dict[str, Any]:
     """一次多模态调用：读商品 + 为这一张图设计专业级提示词。
 
@@ -276,7 +304,48 @@ def design_shot_prompt(
     任一环节失败抛 RelayError，由调用方回退到模板。
     prepared: 已预处理的参考图（`prepare_reference`），多类型并行设计时复用。
     variation: 本张的差异化维度（`PERSON_VARIATIONS` 之一），仅带人物场景传。
+    layout_bytes: A+ 版式参考图（用户上传的版式）。设计模型能看到它，把分区结构翻成英文提示词，
+        出图阶段仍然是单图编辑（generate_batch 不变）。
+    layout_hint: 内置版式的分区描述（无图可给时用它）。
+    brand_name: 品牌A+横幅必填（aplus_banner 专属分支），其他类型忽略。
     """
+    if gen_type == "aplus_banner":
+        # 品牌横幅：跳过商品 inventory 流程，走专属指令（画面只有品牌名艺术字）
+        if not (brand_name or "").strip():
+            raise RelayError("品牌A+横幅缺少品牌名")
+        small = prepared or _shrink_for_analysis(image_bytes)
+        instruction = BANNER_DESIGN_INSTRUCTION.format(
+            platform=_pick_platform(brand_genes),
+            market=_pick_market(brand_genes),
+            brand_name=brand_name.strip(),
+        )
+        content = [
+            {"type": "text", "text": instruction},
+            {"type": "text", "text": (
+                f"Shot type key: aplus_banner\nAspect ratio: 970x300 (about 3.2:1)\n"
+                f"Brand name (the ONLY text, exact spelling & case): {brand_name.strip()}\n"
+                "Now output the JSON object."
+            )},
+            {"type": "image_url", "image_url": {"url": _image_data_uri(small)}},
+        ]
+        chan = _analyze_channel()
+        cfg = get_settings()
+        timeout = int(getattr(cfg, "IMAGE_RELAY_DESIGN_TIMEOUT", 180) or 180)
+        text = _post_chat(chan["base"], chan["key"], chan["model"], content,
+                          timeout, label="视觉模型",
+                          max_tokens=int(getattr(cfg, "IMAGE_RELAY_DESIGN_MAX_TOKENS", 2600) or 2600))
+        data = _parse_design_json(text)
+        prompt_en = (data.get("prompt_en") or "").strip()
+        if not prompt_en:
+            raise RelayError("品牌横幅提示词设计结果为空")
+        return {
+            "product": {},
+            "inventory": [],
+            "prompt_en": prompt_en,
+            "prompt_cn": (data.get("prompt_cn") or "").strip(),
+            "negative": (data.get("negative") or "").strip(),
+        }
+
     spec = SHOT_SPECS.get(gen_type)
     if not spec:
         raise RelayError(f"未定义的图类型: {gen_type}")
@@ -294,6 +363,26 @@ def design_shot_prompt(
         )},
         {"type": "image_url", "image_url": {"url": _image_data_uri(small)}},
     ]
+    # A+ 版式：把版式图作为第 2 张图给设计模型看，让它在 prompt_en 里把分区结构写清楚。
+    # 必须显式禁止搬运版式图里的商品/文案——否则设计模型会把别人的商品也写进清单。
+    if layout_bytes or layout_hint:
+        note = (
+            "LAYOUT REFERENCE (hard requirement for this shot): organise the frame strictly "
+            "according to the A+ layout below — same zone positions, same split ratios, same "
+            "text-free gaps. Borrow ONLY the zone structure and whitespace; never carry over "
+            "the product, copy, logos or colour scheme shown in the layout reference.\n"
+        )
+        if layout_hint:
+            note += f"LAYOUT STRUCTURE: {layout_hint}\n"
+        if layout_bytes:
+            note += "The SECOND image attached is the layout reference.\n"
+        note += "Write prompt_en so the described layout is explicit (which side holds the product, where the clean text gap sits)."
+        content.append({"type": "text", "text": note})
+        if layout_bytes:
+            content.append({
+                "type": "image_url",
+                "image_url": {"url": _image_data_uri(_shrink_for_analysis(layout_bytes))},
+            })
     chan = _analyze_channel()
     # 设计单次输出较长，偶发被模型拖到 240s；用更短的专用超时 + 一次重试，
     # 失败就快速降级到模板，避免整单被一类拖住 5 分钟。
@@ -460,6 +549,21 @@ def _analyze_channel() -> Dict[str, str]:
     }
 
 
+# 429/5xx 重试次数（含首次）。超时不重试：出图单次已 240s，再重试只会双倍计费。
+_RELAY_RETRY_ATTEMPTS = 3
+
+
+def _retry_delay(attempt: int, retry_after: Optional[str] = None) -> float:
+    """指数退避 + 尊重 Retry-After，单次最长 10s"""
+    hinted = 0.0
+    try:
+        if retry_after:
+            hinted = float(str(retry_after).strip())
+    except Exception:
+        hinted = 0.0
+    return min(10.0, max(hinted, 1.5 * (2 ** attempt)))
+
+
 def _post_chat(base: str, key: str, model: str, content: List[Dict[str, Any]],
                timeout: int, *, label: str = "中转站",
                max_tokens: Optional[int] = None,
@@ -470,6 +574,9 @@ def _post_chat(base: str, key: str, model: str, content: List[Dict[str, Any]],
     长篇发挥把单次调用拖到 240s 超时（实测白底图类型出现过）。
     raise_on_length=True 时，若响应因 token 上限被截断则抛错，让调用方放大预算重试
     —— 截断的 JSON 解析必然失败，不抛错就只会被当成「模型返回异常」静默降级模板。
+
+    429/5xx 会按指数退避重试（含 Retry-After）：并发高峰期偶发限流不应直接
+    把整张图判失败；超时不重试（成本与耗时都太高）。
     """
     if not (base and key and model):
         raise RelayError(f"{label}通道配置不完整（base/key/model）")
@@ -480,18 +587,38 @@ def _post_chat(base: str, key: str, model: str, content: List[Dict[str, Any]],
     }
     if max_tokens:
         payload["max_tokens"] = int(max_tokens)
-    try:
-        resp = _session().post(
-            _endpoint(base),
-            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-            json=payload,
-            timeout=timeout,
-        )
-    except requests.Timeout:
-        raise RelayError(f"{label}请求超时（>{timeout}s，模型 {model}）")
-    except Exception as e:
-        raise RelayError(f"{label}连接失败：{e}")
 
+    resp: Optional[requests.Response] = None
+    for attempt in range(_RELAY_RETRY_ATTEMPTS):
+        try:
+            resp = _session().post(
+                _endpoint(base),
+                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                json=payload,
+                timeout=timeout,
+            )
+        except requests.Timeout:
+            raise RelayError(f"{label}请求超时（>{timeout}s，模型 {model}）")
+        except Exception as e:
+            if attempt + 1 < _RELAY_RETRY_ATTEMPTS:
+                delay = _retry_delay(attempt)
+                logger.warning(f"{label}连接失败，{delay:.1f}s 后重试：{e}")
+                time.sleep(delay)
+                continue
+            raise RelayError(f"{label}连接失败：{e}")
+
+        if (resp.status_code == 429 or resp.status_code >= 500) \
+                and attempt + 1 < _RELAY_RETRY_ATTEMPTS:
+            delay = _retry_delay(attempt, resp.headers.get("Retry-After"))
+            logger.warning(
+                f"{label}返回 {resp.status_code}，{delay:.1f}s 后重试"
+                f"（第 {attempt + 1}/{_RELAY_RETRY_ATTEMPTS - 1} 次）"
+            )
+            time.sleep(delay)
+            continue
+        break
+
+    assert resp is not None
     if resp.status_code == 401:
         raise RelayError(f"{label}令牌无效或已过期")
     if resp.status_code == 429:

@@ -551,9 +551,15 @@ async def analyze_product(
     if not result:
         raise HTTPException(status_code=500, detail="AI 分析结果为空，请稍后重试")
 
+    # 同时返回「已格式化文本」：与 AI 生图中转站自动分析用的是同一个 _card_to_text，
+    # 让前端「AI 分析」按钮与后端自动补全产出同一套字段（含组件/尺寸/使用方式/风格倾向），
+    # 避免前端自己再映射一遍导致两边漂移（2026-10-28：local 曾只有 6 字段、relay 有 11 字段）。
+    from services.ai_image_service import _card_to_text  # 局部导入，规避模块级循环依赖
+
     return {
         "success": True,
         "data": result,
+        "text": _card_to_text(result or {}),
     }
 
 

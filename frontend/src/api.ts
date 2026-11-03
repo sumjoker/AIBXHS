@@ -2309,7 +2309,7 @@ export const aiCreationApi = {
   analyzeProduct: (files: File[]) => {
     const formData = new FormData();
     files.forEach((file) => formData.append("files", file));
-    return apiClient.post<{ success: boolean; data: AmazonProductAnalysisResult }>(
+    return apiClient.post<{ success: boolean; data: AmazonProductAnalysisResult; text?: string }>(
       "/ai-creation/analyze-product",
       formData,
       {
@@ -2360,6 +2360,44 @@ export interface AIImageResultItem {
   prompt_designed?: boolean;
   /* AI 从参考图清点出的件数清单（如 "red-and-white fishing bobbers x2"） */
   inventory?: string[] | null;
+  /* A+ 该张使用的版式（内置版式 preset:xxx / 上传版式 db:id） */
+  layout?: AIImageLayoutRef | null;
+  /* 品牌A+横幅的品牌名（保留大小写） */
+  brand_name?: string | null;
+}
+
+/** A+ 版式（官方推荐 / 我的 / 收藏） */
+export interface AIImageLayout {
+  /** 标识：preset:<内置id> 或 db:<素材id> */
+  key: string;
+  id: string | number;
+  name: string;
+  desc?: string;
+  /** horizontal / vertical / square */
+  ratio_tag?: string;
+  /** 给模型的分区描述（上传版式为空，改走版式图） */
+  structure?: string;
+  /** 缩略图分区数据（归一化坐标） */
+  zones?: { x: number; y: number; w: number; h: number; t: "img" | "txt" | "band" | "gap" }[];
+  /** 生成用参考图地址（官方模板 / 上传素材） */
+  image_url?: string;
+  /** 列表缩略图地址（<=480px，仅展示，避免 240 张原图拖死首屏） */
+  cover_url?: string;
+  source?: "preset" | "upload" | "official";
+  favorited?: boolean;
+  favorite?: boolean;
+  width?: number | null;
+  height?: number | null;
+}
+
+/** 任务子项里记录的版式快照 */
+export interface AIImageLayoutRef {
+  key?: string;
+  name?: string;
+  source?: string;
+  ratio_tag?: string;
+  structure?: string;
+  image_url?: string;
 }
 
 export interface AIImageTask {
@@ -2393,10 +2431,28 @@ export interface AIImageTask {
     country?: string;
     language?: string;
     platform?: string;
+    /** A+ 画面文字：no_text=不出现文字（默认）/ with_text=允许 AI 排版文案 */
+    text_mode?: string;
+    /** 品牌A+横幅的品牌名（保留大小写） */
+    brand_name?: string;
   } | null;
   cost_seconds: number | null;
   error_message: string | null;
   created_at: string;
+  /** 进行中任务的排队排位（已完成/失败为 null）：排队中到底在等什么 */
+  queue?: {
+    stage: "comfy" | "relay";
+    /** ComfyUI 队列前面还有几个任务 */
+    ahead?: number | null;
+    /** 本任务在 ComfyUI pending 中的排位（1 基） */
+    position?: number | null;
+    /** 同账号用户级队列里前面还有几单 */
+    user_ahead?: number;
+    comfy_running?: number | null;
+    comfy_pending?: number | null;
+    /** 后端拼好的中文说明，前端直接展示 */
+    hint: string;
+  } | null;
 }
 
 export const aiImageApi = {
@@ -2407,14 +2463,29 @@ export const aiImageApi = {
       generation_types: Record<string, string>;
       aspect_ratios: Record<string, string>;
       aspect_ratios_all?: Record<string, string>;
-      aplus_types?: Record<string, { label: string; gen_ratio: string; target_size: number[] }>;
+      /** size/desc 由服务端按 target_size 下发，前端不再写死尺寸与文案 */
+      aplus_types?: Record<
+        string,
+        { label: string; gen_ratio: string; target_size: number[]; size?: string; desc?: string }
+      >;
       main_types?: Record<string, string>;
+      /** 主副图卡片说明（key 与 main_types 对应） */
+      main_type_descriptions?: Record<string, string>;
+      /** 场景图父项 + 两条子路径（不带人物 / 带人物） */
+      scene_group?: {
+        key: string;
+        label: string;
+        hint: string;
+        variants: { key: string; label: string; hint: string }[];
+      };
       brand_options?: {
         countries: string[];
         languages: string[];
         platforms: string[];
         font_styles: string[];
       };
+      /** 品牌默认值（与后端 DEFAULT_BRAND_SETTINGS 同源） */
+      brand_defaults?: { country?: string; language?: string; platform?: string };
       max_ref_images?: number;
       max_sheets_per_task?: number;
       /** 可选生成模型（本地 / 中转站） */
@@ -2450,6 +2521,10 @@ export const aiImageApi = {
       brand_settings?: Record<string, string>;
       /** 生成通道：local=本地 Qwen Image 2.1 / relay=中转站 Nano Banana 2 */
       provider?: "local" | "relay";
+      /** A+ 版式标识（preset:xxx / db:id），空=后端随机官方版式；品牌A+横幅忽略 */
+      layout_ids?: string[];
+      /** 品牌A+横幅必填的英文品牌名（保留大小写，2–20 字符） */
+      brand_name?: string;
     },
     idempotencyKey?: string,
   ) => {
@@ -2471,6 +2546,8 @@ export const aiImageApi = {
     if (params.brand_settings && Object.keys(params.brand_settings).length)
       formData.append("brand_settings", JSON.stringify(params.brand_settings));
     if (params.provider) formData.append("provider", params.provider);
+    formData.append("layout_ids", JSON.stringify(params.layout_ids || []));
+    if (params.brand_name) formData.append("brand_name", params.brand_name);
     return apiClient.post<AIImageTask>("/ai-image/tasks", formData, {
       headers: {
         "Content-Type": "multipart/form-data",
@@ -2504,6 +2581,49 @@ export const aiImageApi = {
   /** 删除套图生成任务记录 */
   deleteTask: (taskId: number) =>
     apiClient.delete<{ success: boolean }>(`/ai-image/tasks/${taskId}`),
+
+  // ===== A+ 版式（选择排版 → 每种排版生成一张）=====
+  /** 版式库：官方推荐 / 我的 / 收藏 */
+  getLayouts: () =>
+    apiClient.get<{
+      presets: AIImageLayout[];
+      mine: AIImageLayout[];
+      favorites: AIImageLayout[];
+      counts?: { official?: number; structural?: number; mine?: number };
+      limit: number;
+      ratio_tags: { value: string; label: string }[];
+    }>("/ai-image/layouts"),
+  /** 上传自己的版式参考图 */
+  uploadLayout: (file: File, name = "") => {
+    const fd = new FormData();
+    fd.append("file", file);
+    fd.append("name", name);
+    return apiClient.post<AIImageLayout>("/ai-image/layouts/upload", fd, {
+      headers: { "Content-Type": "multipart/form-data" },
+      timeout: 120000,
+    });
+  },
+  /** 收藏 / 取消收藏 */
+  favoriteLayout: (key: string, favorite: boolean) =>
+    apiClient.post<{ key: string; favorited: boolean }>("/ai-image/layouts/favorite", {
+      key,
+      favorite,
+    }),
+  /** 删除自己上传的版式 */
+  deleteLayout: (id: number) =>
+    apiClient.delete<{ ok: boolean }>(`/ai-image/layouts/${id}`),
+  /** 保存版式结构描述（分区文字约束，留空=只用参考图） */
+  saveLayoutStructure: (id: number, structure: string) =>
+    apiClient.put<{ id: number; structure: string }>(`/ai-image/layouts/${id}/structure`, {
+      structure,
+    }),
+  /** AI 读版式图生成结构描述草稿（不落库） */
+  suggestLayoutStructure: (id: number) =>
+    apiClient.post<{ id: number; structure: string; name?: string }>(
+      `/ai-image/layouts/${id}/structure/suggest`,
+      {},
+      { timeout: 120000 },
+    ),
 };
 
 export default apiClient;

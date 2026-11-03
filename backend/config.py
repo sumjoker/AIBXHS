@@ -103,9 +103,31 @@ class Settings(BaseSettings):
     IMAGE_PROMPT_TEMPLATES_PATH: str = os.path.join(
         os.path.dirname(os.path.abspath(__file__)), "prompts", "image_prompt_templates.json"
     )
+    # A+ 提示词通道实验（2026-10-29）：空=走现有链路（PE→497）；
+    # direct=A+ 专用工作流（497 直连 571，跳过 PE）；
+    # append=A+ 专用工作流（PE 输出后再强制拼接版式契约节点 572，PE 改写不到）。
+    # 只影响本地 ComfyUI 的 A+ 子任务；主副图与中转站通道不受影响。
+    IMAGE_APLUS_PROMPT_MODE: str = ""
+    # 品牌A+横幅（970×300）专用工作流：自定义 latent 约 3.2:1，参考图只进 PE、
+    # 不进入 497 图像条件（画面只出现品牌名，不出现商品）。
+    IMAGE_BRAND_BANNER_WORKFLOW_PATH: str = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "workflows", "qwen_image_workflow_banner.json"
+    )
+    # A+ 版式预设库（内置「官方推荐」；用户上传/收藏落 ai_image_layouts 表）
+    IMAGE_LAYOUT_PRESETS_PATH: str = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "prompts", "aplus_layouts.json"
+    )
+    IMAGE_MAX_LAYOUTS_PER_TASK: int = 8  # 单任务最多选几个版式（每个版式生成一张，对齐官方交互）
     IMAGE_POLL_INTERVAL: int = 2        # 轮询生成进度间隔（秒）：首轮立即查，之后按此间隔
     IMAGE_MAX_WAIT_MINUTES: int = 30    # 单任务最长等待时间（分钟），PE 首载 GGUF 可能 1~3 分钟
     IMAGE_MAX_CONCURRENT_TASKS: int = 2 # 单实例同时轮询的最大任务数（ComfyUI 串行队列，与生视频互让）
+    # 提交背压：ComfyUI 队列（running+pending）超过该深度时先等位，避免多用户并发把队列灌满
+    IMAGE_MAX_QUEUE_DEPTH: int = 8
+    IMAGE_QUEUE_WAIT_SECONDS: int = 60   # 单张提交前最长等待队列回落的秒数（12 张累计不超过整单超时）
+    # 生图优先于超分/视频入队（ComfyUI 无优先级接口，只能在入队前让路）：
+    # false = 完全退回 FIFO；等待上限保证视频不会被生图无限期饿死。
+    COMFY_IMAGE_PRIORITY: bool = True
+    COMFY_IMAGE_PRIORITY_WAIT_SECONDS: int = 180
 
     # 生图中转站：Nano Banana 2（gemini-3.1-flash-image，OpenAI 兼容 /chat/completions）
     IMAGE_RELAY_API_BASE: str = ""

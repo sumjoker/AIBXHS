@@ -123,6 +123,7 @@ def init_db():
         )
         from models.ai_video_task import AIVideoTask
         from models.ai_image_task import AIImageTask
+        from models.ai_image_layout import AIImageLayout
         from models.video_binding_request import VideoBindingRequest
 
         # 创建所有表
@@ -141,6 +142,10 @@ def init_db():
                 ("review_analyses", "departments",
                  "ALTER TABLE review_analyses ADD COLUMN departments VARCHAR(100) NULL "
                  "COMMENT '问题板块多选，逗号分隔:operations/purchasing/warehouse/design'"),
+                # A+ 版式素材：列表用缩略图（原图 1~2MB，240 张直接进列表会把首屏拖死）
+                ("ai_image_layouts", "thumb_url",
+                 "ALTER TABLE ai_image_layouts ADD COLUMN thumb_url VARCHAR(1000) NULL "
+                 "COMMENT '列表缩略图地址（TOS，<=480px，仅展示）'"),
             ])
             conn.commit()
         

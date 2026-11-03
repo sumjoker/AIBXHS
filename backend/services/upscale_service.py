@@ -211,6 +211,10 @@ def _run_task(task_id: int) -> None:
             # 2. 上传 ComfyUI 并提交工作流
             video_name = _upload_video(content)
             workflow = _build_workflow(video_name, _get_scale(task_id))
+            # 生图优先：有生图任务在等 ComfyUI 时先让路（上限 COMFY_IMAGE_PRIORITY_WAIT_SECONDS）
+            from services import comfy_priority
+
+            comfy_priority.wait_before_enqueue("超分", task_id)
             resp = _api("POST", "/prompt", json={"prompt": workflow})
             prompt_id = resp.json()["prompt_id"]
             _update_task(task_id, comfy_prompt_id=prompt_id)

@@ -247,6 +247,7 @@ def _init_tenant_permissions_and_admin_role(db: Session, tenant_id: int):
         # 媒体创作中心
         {"name": "AI视频", "code": "ai_video:use", "type": "function", "module": "媒体创作中心", "sort_order": 71},
         {"name": "审批视频绑定", "code": "ai_video:approve", "type": "function", "module": "媒体创作中心", "sort_order": 72},
+        {"name": "AI生图", "code": "ai_image:use", "type": "function", "module": "媒体创作中心", "sort_order": 73},
         # 挪货管理
         {"name": "查看挪货", "code": "stock_transfer:view", "type": "function", "module": "挪货管理", "sort_order": 55},
         {"name": "新增挪货", "code": "stock_transfer:create", "type": "function", "module": "挪货管理", "sort_order": 56},

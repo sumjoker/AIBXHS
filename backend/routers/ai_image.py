@@ -9,7 +9,7 @@ import time
 
 from pydantic import BaseModel
 
-from dependencies import get_current_user
+from dependencies import PermissionChecker
 from models.user import User
 from config import get_settings
 from services.ai_image_service import (
@@ -26,7 +26,10 @@ from services.ai_image_service import (
     ASPECT_RATIO_MAP,
     APLUS_SPECS,
     MAIN_GEN_TYPES,
+    MAIN_TYPE_DESCRIPTIONS,
+    SCENE_GROUP,
     BRAND_OPTIONS,
+    DEFAULT_BRAND_SETTINGS,
     MAX_REF_IMAGES,
     MAX_SHEETS_PER_TASK,
     _supported_ratio_options,
@@ -76,7 +79,7 @@ def _idem_settle(key: str, task: Dict[str, Any] = None) -> None:
 
 
 @router.get("/options")
-async def get_options(current_user: User = Depends(get_current_user)) -> Dict[str, Any]:
+async def get_options(current_user: User = Depends(PermissionChecker("ai_image:use"))) -> Dict[str, Any]:
     """生成类型与比例选项（供前端渲染）
 
     比例以 ComfyUI 实时能力为准：探测失败时回退静态表，避免因节点探测抖动禁用整页。
@@ -93,11 +96,25 @@ async def get_options(current_user: User = Depends(get_current_user)) -> Dict[st
         # 生成通道（本地 ComfyUI / 中转站）
         "providers": _provider_options(),
         # v2 分组选项
-        "aplus_types": {k: {"label": v["label"], "gen_ratio": v["gen_ratio"],
-                             "target_size": list(v["target_size"])}
-                         for k, v in APLUS_SPECS.items()},
+        # size：由 target_size 拼出的展示文案（1464×600），前端不再各自写死；
+        # desc：卡片副标题，避免改后端尺寸时前端文案跟着失真。
+        "aplus_types": {
+            k: {
+                "label": v["label"],
+                "gen_ratio": v["gen_ratio"],
+                "target_size": list(v["target_size"]),
+                "size": f"{v['target_size'][0]}×{v['target_size'][1]}",
+                "desc": v.get("desc", ""),
+            }
+            for k, v in APLUS_SPECS.items()
+        },
         "main_types": dict(MAIN_GEN_TYPES),
+        # 主副图卡片说明 + 场景图父项/子路径结构（含历史记录标签用的带人物项）
+        "main_type_descriptions": dict(MAIN_TYPE_DESCRIPTIONS),
+        "scene_group": SCENE_GROUP,
         "brand_options": BRAND_OPTIONS,
+        # 品牌默认值：与后端 DEFAULT_BRAND_SETTINGS 同源，避免前端写死成另一套市场
+        "brand_defaults": dict(DEFAULT_BRAND_SETTINGS),
         # 上限（前端据此渲染张数控件与计数文案）
         "max_ref_images": MAX_REF_IMAGES,
         "max_sheets_per_task": MAX_SHEETS_PER_TASK,
@@ -185,6 +202,118 @@ def _provider_options() -> List[Dict[str, Any]]:
     ]
 
 
+@router.get("/layouts")
+async def get_layouts(current_user: User = Depends(PermissionChecker("ai_image:use"))) -> Dict[str, Any]:
+    """A+ 版式库：官方推荐（带收藏标记）/ 我的（上传）/ 收藏"""
+    from services.ai_image_layout_service import LayoutError, list_layouts
+
+    try:
+        return list_layouts(current_user.id, current_user.tenant_id or 0)
+    except LayoutError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception:
+        logger.exception("[AI生图] 读取版式库失败")
+        raise HTTPException(status_code=500, detail="读取版式库失败")
+
+
+@router.post("/layouts/upload")
+async def upload_layout(
+    file: UploadFile = File(..., description="版式参考图，<=10MB"),
+    name: str = Form("", description="版式名称"),
+    current_user: User = Depends(PermissionChecker("ai_image:use")),
+) -> Dict[str, Any]:
+    """上传自己的版式（「我的」标签页）"""
+    from services.ai_image_layout_service import LayoutError, add_upload
+
+    name_hint, content = _validate_images([file])[0]
+    try:
+        return add_upload(current_user.id, current_user.tenant_id or 0,
+                          current_user.username or "", content, name_hint, name)
+    except LayoutError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception:
+        logger.exception("[AI生图] 版式上传失败")
+        raise HTTPException(status_code=500, detail="版式上传失败")
+
+
+class LayoutFavoriteIn(BaseModel):
+    key: str
+    favorite: bool = True
+
+
+class LayoutStructureIn(BaseModel):
+    structure: str = ""
+
+
+@router.put("/layouts/{layout_id}/structure")
+async def save_layout_structure(
+    layout_id: int,
+    payload: LayoutStructureIn = Body(...),
+    current_user: User = Depends(PermissionChecker("ai_image:use")),
+) -> Dict[str, Any]:
+    """保存版式结构描述（下一次生成即带上该文字约束；留空=只用参考图）"""
+    from services.ai_image_layout_service import LayoutError, update_structure
+
+    try:
+        return update_structure(current_user.id, current_user.tenant_id or 0,
+                                layout_id, payload.structure)
+    except LayoutError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception:
+        logger.exception("[AI生图] 保存版式结构描述失败")
+        raise HTTPException(status_code=500, detail="保存失败")
+
+
+@router.post("/layouts/{layout_id}/structure/suggest")
+async def suggest_layout_structure(
+    layout_id: int,
+    current_user: User = Depends(PermissionChecker("ai_image:use")),
+) -> Dict[str, Any]:
+    """AI 读版式图产出结构描述草稿（不落库，前端确认后再保存）"""
+    from services.ai_image_layout_service import LayoutError, suggest_structure
+
+    try:
+        return suggest_structure(current_user.id, current_user.tenant_id or 0, layout_id)
+    except LayoutError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception:
+        logger.exception("[AI生图] AI 生成版式结构描述失败")
+        raise HTTPException(status_code=500, detail="AI 生成失败")
+
+
+@router.post("/layouts/favorite")
+async def favorite_layout(
+    payload: LayoutFavoriteIn = Body(...),
+    current_user: User = Depends(PermissionChecker("ai_image:use")),
+) -> Dict[str, Any]:
+    """收藏/取消收藏（内置版式 key=preset:xxx，上传版式 key=db:id）"""
+    from services.ai_image_layout_service import LayoutError, set_favorite
+
+    try:
+        return set_favorite(current_user.id, current_user.tenant_id or 0,
+                            payload.key, payload.favorite)
+    except LayoutError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception:
+        logger.exception("[AI生图] 版式收藏失败")
+        raise HTTPException(status_code=500, detail="版式收藏失败")
+
+
+@router.delete("/layouts/{layout_id}")
+async def delete_layout(layout_id: int, current_user: User = Depends(PermissionChecker("ai_image:use"))) -> Dict[str, Any]:
+    """删除自己上传的版式（软删，历史任务不受影响）"""
+    from services.ai_image_layout_service import LayoutError, delete_layout as _delete
+
+    try:
+        _delete(current_user.id, current_user.tenant_id or 0, layout_id)
+        return {"ok": True}
+    except LayoutError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception:
+        logger.exception("[AI生图] 删除版式失败")
+        raise HTTPException(status_code=500, detail="删除版式失败")
+
+
 @router.post("/tasks")
 async def create_image_task(
     files: List[UploadFile] = File(..., description="参考图，1~8 张（第 1 张为主参考）"),
@@ -193,17 +322,20 @@ async def create_image_task(
     aspect_ratio: str = Form("1:1"),
     image_count: int = Form(1, ge=1, le=4),
     # ===== v2 分组参数 =====
-    aplus_type: str = Form("", description="A+ 类型（单选）：aplus_advanced/aplus_normal/aplus_mobile，空=未选"),
+    aplus_type: str = Form("", description="A+ 类型（单选）：aplus_advanced/aplus_normal/aplus_mobile/aplus_banner，空=未选"),
     main_types: str = Form("[]", description='主副图类型 JSON 数组，如 ["selling_point","white_background"]'),
     main_aspect_ratio: str = Form("1:1", description="主副图生成比例"),
     brand_settings: str = Form("", description='品牌自定义设置 JSON（主色/字体/自定义文本/国家/语言/平台）'),
     product_info: str = Form("", description="商品信息（卖点/材质/场景等）"),
+    product_fact_card: str = Form("", description="P4 结构化商品事实卡 JSON（提供时覆盖 product_info）"),
     prompt: str = Form("", description="附加提示词"),
     product_code: str = Form(""),
     product_name: str = Form(""),
     provider: str = Form("local", description="生成通道：local=本地 Qwen Image 2.1 / relay=中转站 Nano Banana 2"),
+    layout_ids: str = Form("[]", description='A+ 版式标识 JSON 数组，如 ["preset:left_text_right_image","db:12"]；空=随机官方版式（品牌A+横幅忽略）'),
+    brand_name: str = Form("", description="品牌A+横幅必填的英文品牌名（保留大小写，2–20 字符）"),
     idempotency_key: str = Header("", alias="Idempotency-Key"),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(PermissionChecker("ai_image:use")),
 ):
     """提交商品套图生成任务：落库后立即返回，生成在后台进行"""
     # 幂等：前端同一份表单只带一个 key；重复点击/重试不会产生第二单
@@ -238,7 +370,22 @@ async def create_image_task(
             except (ValueError, TypeError):
                 raise HTTPException(status_code=400, detail="brand_settings 必须是 JSON 对象")
 
+        fact_card: dict = {}
+        if product_fact_card:
+            try:
+                fact_card = json.loads(product_fact_card)
+                if not isinstance(fact_card, dict):
+                    raise ValueError
+            except (ValueError, TypeError):
+                raise HTTPException(status_code=400, detail="product_fact_card 必须是 JSON 对象")
+
         images = _validate_images(files)
+        from services.ai_image_layout_service import LayoutError, parse_layout_keys
+        try:
+            layout_keys = parse_layout_keys(layout_ids)
+        except LayoutError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
         task = submit_image_task(
             tenant_id=current_user.tenant_id,
             user_id=current_user.id,
@@ -257,6 +404,9 @@ async def create_image_task(
             main_aspect_ratio=main_aspect_ratio,
             brand_settings=brand or None,
             provider=provider,
+            layout_keys=layout_keys,
+            product_fact_card=fact_card or None,
+            brand_name=brand_name,
         )
     except HTTPException:
         _idem_settle(idem_key)
@@ -280,7 +430,7 @@ async def list_tasks(
     page_size: int = 10,
     keyword: str = "",
     status: str = "",
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(PermissionChecker("ai_image:use")),
 ):
     """套图生成任务列表（分页，按时间倒序；status 由服务端过滤，保证分页自洽）"""
     try:
@@ -292,7 +442,7 @@ async def list_tasks(
 
 
 @router.get("/tasks/{task_id}")
-async def get_task(task_id: int, current_user: User = Depends(get_current_user)):
+async def get_task(task_id: int, current_user: User = Depends(PermissionChecker("ai_image:use"))):
     """单任务详情（前端轮询用：只拉当前页仍在生成的单条，避免整页重复传输）"""
     try:
         return get_image_task(current_user.tenant_id, task_id)
@@ -301,14 +451,17 @@ async def get_task(task_id: int, current_user: User = Depends(get_current_user))
 
 
 @router.delete("/tasks/{task_id}")
-async def remove_task(task_id: int, current_user: User = Depends(get_current_user)):
-    """删除任务记录（软删除，不影响已生成的图片）"""
-    delete_image_task(current_user.tenant_id, task_id)
+async def remove_task(task_id: int, current_user: User = Depends(PermissionChecker("ai_image:use"))):
+    """删除任务记录，并清理该任务在 TOS 的参考图/生成图"""
+    try:
+        delete_image_task(current_user.tenant_id, task_id)
+    except AIImageError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     return {"success": True}
 
 
 @router.post("/tasks/{task_id}/cancel")
-async def cancel_task(task_id: int, current_user: User = Depends(get_current_user)):
+async def cancel_task(task_id: int, current_user: User = Depends(PermissionChecker("ai_image:use"))):
     """取消排队中/生成中的任务（已执行的那一张会自然结束，不再回收）"""
     try:
         return cancel_image_task(current_user.tenant_id, task_id)
@@ -320,7 +473,7 @@ async def cancel_task(task_id: int, current_user: User = Depends(get_current_use
 async def retry_task(
     task_id: int,
     payload: Optional[Dict[str, Any]] = Body(default=None),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(PermissionChecker("ai_image:use")),
 ):
     """重试失败子项：body 可带 {"indices": [0, 2]}，缺省重试全部失败项"""
     indices = (payload or {}).get("indices")
@@ -337,7 +490,7 @@ async def retry_task(
 
 
 @router.get("/tasks/{task_id}/download.zip")
-async def download_zip(task_id: int, current_user: User = Depends(get_current_user)):
+async def download_zip(task_id: int, current_user: User = Depends(PermissionChecker("ai_image:use"))):
     """打包下载该任务全部已生成的图片"""
     try:
         data, filename = build_task_zip(current_user.tenant_id, task_id)
@@ -354,7 +507,7 @@ async def download_zip(task_id: int, current_user: User = Depends(get_current_us
 
 
 @router.get("/comfy-history/{prompt_id}")
-async def get_comfy_history(prompt_id: str, current_user: User = Depends(get_current_user)):
+async def get_comfy_history(prompt_id: str, current_user: User = Depends(PermissionChecker("ai_image:use"))):
     """按 ComfyUI prompt_id 查执行历史：原始提示词 + PE 优化后提示词（生图详情弹窗用）"""
     # 归属校验：prompt_id 属于其他租户时一律 404（不泄露存在性）
     if not prompt_belongs_to_tenant(current_user.tenant_id, prompt_id):

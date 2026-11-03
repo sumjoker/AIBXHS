@@ -42,15 +42,19 @@ import {
   RedoOutlined,
   StopOutlined,
   LinkOutlined,
+  QuestionCircleOutlined,
+  ClockCircleOutlined,
 } from '@ant-design/icons'
 import type { UploadFile } from 'antd/es/upload'
 import BindProductModal from '../components/BindProductModal'
+import AIImageLayoutPicker from '../components/AIImageLayoutPicker'
 import {
   aiImageApi,
   aiCreationApi,
   productsApi,
   AIImageTask,
   AIImageResultItem,
+  AIImageLayout,
   AmazonProductAnalysisResult,
 } from '../api'
 
@@ -71,45 +75,24 @@ interface ProductOptionItem {
   images: string[]
 }
 
-/** A+ 类型（单选） */
-const APLUS_OPTIONS = [
-  { value: 'aplus_advanced', label: '高级A+', size: '1464×600', desc: '超宽幅品牌横幅，A+ 页面顶部大图' },
-  { value: 'aplus_normal', label: '普通A+', size: '970×600', desc: '标准 A+ 页面横幅' },
-  { value: 'aplus_mobile', label: '手机A+', size: '600×450', desc: '移动端 A+ 图，小屏浏览' },
-] as const
-
-/** 主副图类型（多选）。场景图是父项，勾选后展开「带人物 / 不带人物」两条子路径。 */
-const MAIN_TYPE_LABELS: Record<string, string> = {
-  selling_point: '卖点图',
-  white_background: '白底图',
-  scene: '场景图',
-  closeup: '特写图',
-  closeup_white: '特写白底图',
-}
-/** 场景图的两条子路径（key 与后端一致；scene 保留 = 不带人物，scene_person = 带人物） */
-const SCENE_VARIANTS: { key: string; label: string; hint: string }[] = [
-  { key: 'scene', label: '场景图（不带人物）', hint: '商品置于真实使用场景，画面中不出现任何人物' },
-  { key: 'scene_person', label: '场景图（带人物）', hint: '成年模特按使用方式佩戴/使用商品；严禁儿童' },
-]
-const SCENE_VARIANT_KEYS = SCENE_VARIANTS.map((v) => v.key)
-/** 含子项的完整标签表：历史 Tag、旧记录回填过滤都走它 */
-const TYPE_LABEL_ALL: Record<string, string> = {
-  ...MAIN_TYPE_LABELS,
-  scene_person: '场景图（带人物）',
-}
-const MAIN_TYPE_DESCRIPTIONS: Record<string, string> = {
-  selling_point: '商品置于卖点匹配的场景，配文字排版展示卖点',
-  white_background: '商品精修后放置于纯白色背景',
-  scene: '商品置于真实使用场景，可展开选择带人物 / 不带人物',
-  closeup: '与卖点匹配的局部特写细节',
-  closeup_white: '白底局部特写细节',
+/** A+ 类型卡片（标签 / 尺寸 / 说明全部来自 /options 的 aplus_types，前端不再写死） */
+interface AplusOption {
+  value: string
+  label: string
+  size: string
+  desc: string
 }
 
-/** 兼容 v1 旧记录的类型标签 */
-const LEGACY_TYPE_LABELS: Record<string, string> = {
-  ...TYPE_LABEL_ALL,
-  aplus: 'A+图',
+/** 场景图父项 + 两条子路径（来自 /options 的 scene_group） */
+interface SceneGroup {
+  key: string
+  label: string
+  hint: string
+  variants: { key: string; label: string; hint: string }[]
 }
+
+/** 兼容 v1 旧记录的类型标签（现代类型标签走 /options.main_types） */
+const LEGACY_TYPE_LABELS: Record<string, string> = { aplus: 'A+图' }
 
 const STATUS_COLORS: Record<string, string> = {
   排队中: 'default',
@@ -120,10 +103,14 @@ const STATUS_COLORS: Record<string, string> = {
   已取消: 'default',
 }
 
+/** 品牌设置初始值：服务端 /options.brand_defaults 到达后覆盖前三项 */
 const BRAND_DEFAULTS = {
   country: 'US 美国',
   language: '英语',
   platform: '亚马逊',
+  // A+ 画面文字：no_text=画面不出现任何文字（默认，文案后期叠加）/ with_text=允许 PE 排版英文文案。
+  // 无字时后端会同时剔除「画面文字语言」——该字段会把 PE 整段输出切成英文（2026-10-28 实测）。
+  text_mode: 'no_text',
 }
 
 type BrandSettings = typeof BRAND_DEFAULTS
@@ -176,6 +163,7 @@ const AIImageStudio: React.FC = () => {
   const [fileList, setFileList] = useState<UploadFile[]>([])
   const [maxImages, setMaxImages] = useState(DEFAULT_MAX_IMAGES)
   const [maxSheets, setMaxSheets] = useState(DEFAULT_MAX_SHEETS)
+  const maxLayouts = 8   // 与后端 IMAGE_MAX_LAYOUTS_PER_TASK / 官方交互一致
   /** 生成通道：local=本地 Qwen Image 2.1 / relay=中转站 Nano Banana 2 */
   const [provider, setProvider] = useState<'local' | 'relay'>('local')
   const [providers, setProviders] = useState<
@@ -183,11 +171,27 @@ const AIImageStudio: React.FC = () => {
   >([])
   const [dragging, setDragging] = useState(false)
   const [availableRatios, setAvailableRatios] = useState<string[]>(ALL_RATIO_KEYS)
+  // 服务端下发的选项：A+ 类型、主副图标签/说明、场景图父子结构、品牌下拉
+  const [aplusOptions, setAplusOptions] = useState<AplusOption[]>([])
+  const [mainTypeLabels, setMainTypeLabels] = useState<Record<string, string>>({})
+  const [mainTypeDescriptions, setMainTypeDescriptions] = useState<Record<string, string>>({})
+  const [sceneGroup, setSceneGroup] = useState<SceneGroup | null>(null)
+  const [brandOptions, setBrandOptions] = useState<{
+    countries: string[]
+    languages: string[]
+    platforms: string[]
+    font_styles: string[]
+  }>({ countries: [], languages: [], platforms: [], font_styles: [] })
   const [analyzing, setAnalyzing] = useState(false)
   const [productInfo, setProductInfo] = useState('')
   // v2 分组：A+（单选，空=不生成）与主副图（多选）独立设置
   const [aplusType, setAplusType] = useState<string>('')
   const [aplusCount, setAplusCount] = useState(1)
+  // 品牌A+横幅：品牌名为画面唯一文字，区分大小写（AI 艺术字直出，不走版式模板）
+  const [brandName, setBrandName] = useState('')
+  // A+ 版式：选中的排版（每种生成一张；空=后端随机官方版式）
+  const [layouts, setLayouts] = useState<AIImageLayout[]>([])
+  const [layoutOpen, setLayoutOpen] = useState(false)
   const [mainEnabled, setMainEnabled] = useState(true)
   const [selectedMainTypes, setSelectedMainTypes] = useState<string[]>([
     'white_background',
@@ -264,7 +268,8 @@ const AIImageStudio: React.FC = () => {
     fetchTasks()
   }, [fetchTasks])
 
-  // 一次性拉取服务端能力：ComfyUI 地址、参考图/张数上限、真实可用比例
+  // 一次性拉取服务端能力：ComfyUI 地址、参考图/张数上限、真实可用比例、
+  // A+/主副图类型与品牌下拉（类型标签与尺寸文案以服务端为准，前端不再各存一份）
   useEffect(() => {
     aiImageApi
       .getOptions()
@@ -278,6 +283,35 @@ const AIImageStudio: React.FC = () => {
           const ordered = ALL_RATIO_KEYS.filter((k) => keys.includes(k))
           setAvailableRatios(ordered.length ? ordered : keys)
         }
+        if (data?.aplus_types) {
+          setAplusOptions(
+            Object.entries(data.aplus_types).map(([value, o]) => ({
+              value,
+              label: o.label,
+              // 老版本服务端只有 target_size，按它拼展示文案，避免出现空尺寸
+              size:
+                o.size ||
+                (Array.isArray(o.target_size) && o.target_size.length === 2
+                  ? `${o.target_size[0]}×${o.target_size[1]}`
+                  : ''),
+              desc: o.desc || '',
+            })),
+          )
+        }
+        if (data?.main_types) setMainTypeLabels(data.main_types)
+        if (data?.main_type_descriptions) setMainTypeDescriptions(data.main_type_descriptions)
+        if (data?.scene_group?.variants?.length) setSceneGroup(data.scene_group)
+        if (data?.brand_options) setBrandOptions(data.brand_options)
+        // 默认国家/语言/平台同样以服务端为准（与提示词里的市场语境保持一致）
+        const bd = data?.brand_defaults
+        if (bd) {
+          setBrand((b) => ({
+            ...b,
+            country: bd.country || b.country,
+            language: bd.language || b.language,
+            platform: bd.platform || b.platform,
+          }))
+        }
       })
       .catch(() => setH3BaseUrl(''))
   }, [])
@@ -288,6 +322,16 @@ const AIImageStudio: React.FC = () => {
       setMainAspectRatio(availableRatios[0])
     }
   }, [availableRatios, mainAspectRatio])
+
+  // ===== 主副图卡片结构（服务端下发） =====
+  // 场景图在 UI 上是「父项 + 两条子路径」：父项 key 复用 scene，
+  // 子路径 scene / scene_person 不单独占一行，故从行列表里剔除。
+  const sceneVariants = sceneGroup?.variants || []
+  const sceneVariantKeys = sceneVariants.map((v) => v.key)
+  const sceneParentKey = sceneGroup?.key || ''
+  const mainTypeRows = Object.entries(mainTypeLabels).filter(
+    ([key]) => (sceneParentKey ? key === sceneParentKey || !sceneVariantKeys.includes(key) : true),
+  )
 
   // 当前详情子项的 ComfyUI prompt_id（新记录取子项字段，旧记录回退任务级列表按下标取）
   const currentPromptId = resultDetail
@@ -371,9 +415,12 @@ const AIImageStudio: React.FC = () => {
       .map((t) => t.id)
   }, [tasks])
 
-  // 有进行中任务时 5 秒轮询单任务：只替换变化的那几条，不再整页重拉
+  // 有进行中任务时 5 秒轮询单任务：只替换变化的那几条，不再整页重拉。
+  // 页面不可见时暂停（后台标签页不必空转），切回来立即补一轮。
   useEffect(() => {
-    const timer = setInterval(async () => {
+    let timer: number | undefined
+
+    const pollOnce = async () => {
       const ids = activeIdsRef.current
       if (!ids.length) return
       try {
@@ -383,8 +430,32 @@ const AIImageStudio: React.FC = () => {
       } catch {
         // 单次失败静默，下一轮继续；避免网络抖动反复弹错
       }
-    }, 5000)
-    return () => clearInterval(timer)
+    }
+
+    const start = () => {
+      if (timer !== undefined) return
+      timer = window.setInterval(pollOnce, 5000)
+    }
+    const stop = () => {
+      if (timer === undefined) return
+      window.clearInterval(timer)
+      timer = undefined
+    }
+    const onVisibilityChange = () => {
+      if (document.hidden) {
+        stop()
+      } else {
+        start()
+        void pollOnce()
+      }
+    }
+
+    if (!document.hidden) start()
+    document.addEventListener('visibilitychange', onVisibilityChange)
+    return () => {
+      stop()
+      document.removeEventListener('visibilitychange', onVisibilityChange)
+    }
   }, [])
 
   // ===== 上传辅助（对齐 AI 生视频） =====
@@ -587,7 +658,10 @@ const AIImageStudio: React.FC = () => {
     try {
       const { data } = await aiCreationApi.analyzeProduct(files)
       if (data?.success && data.data) {
-        setProductInfo(analysisToText(data.data))
+        // 后端已用同一份 _card_to_text 拼好 11 字段文本（含组件/尺寸/使用方式），
+        // 直接用它，保证「AI 分析」与中转站自动分析的字段一致；旧后端无 text 时回退本地映射。
+        const text = (data.text || '').trim()
+        setProductInfo(text || analysisToText(data.data))
         message.success('AI 分析完成，商品信息已填充')
       } else {
         message.error('AI 分析未返回结果')
@@ -601,8 +675,13 @@ const AIImageStudio: React.FC = () => {
 
   // ===== 提交生成任务（v2 分组参数）=====
   const activeMainTypeCount = mainEnabled ? selectedMainTypes.length : 0
+  // A+ 张数：选了版式时每种版式一张（版式数即张数），未选时按张数输入；
+  // 品牌横幅不使用版式，张数完全由用户自选。
+  const aplusSheets = aplusType
+    ? (aplusType === 'aplus_banner' ? aplusCount : (layouts.length || aplusCount))
+    : 0
   const totalSheets =
-    (aplusType ? aplusCount : 0) +
+    aplusSheets +
     (mainEnabled ? selectedMainTypes.reduce((a, t) => a + (mainCounts[t] || 1), 0) : 0)
 
   /** 张数加减控件（父项与场景图子路径共用，1~4 张/类型） */
@@ -647,6 +726,17 @@ const AIImageStudio: React.FC = () => {
         message.warning('请在「A+图设置」或「主副图设置」中至少选择一种类型')
         return
       }
+      if (aplusType === 'aplus_banner') {
+        const name = brandName.trim()
+        // 英文品牌名：2–20 字符，区分大小写，至少含一个字母
+        if (
+          !/^[A-Za-z0-9&'.,\- ]{2,20}$/.test(name) ||
+          !/[A-Za-z]/.test(name)
+        ) {
+          message.warning('请填写英文品牌名（2–20 个字符，区分大小写，仅字母/数字/空格/&\'-,.）')
+          return
+        }
+      }
       if (totalSheets > maxSheets) {
         message.warning(`单个任务最多生成 ${maxSheets} 张（当前 ${totalSheets} 张），请减少类型或张数`)
         return
@@ -667,7 +757,10 @@ const AIImageStudio: React.FC = () => {
             ? Object.fromEntries(activeMainTypes.map((t) => [t, mainCounts[t] || 1]))
             : undefined,
           main_aspect_ratio: activeMainTypes.length ? mainAspectRatio : undefined,
-          image_count: aplusType ? aplusCount : 1,
+          image_count: aplusType ? aplusSheets : 1,
+          layout_ids:
+            aplusType && aplusType !== 'aplus_banner' ? layouts.map((l) => l.key) : [],
+          brand_name: aplusType === 'aplus_banner' ? brandName.trim() : undefined,
           product_info: productInfo,
           prompt: extraPrompt,
           brand_settings: {
@@ -695,8 +788,8 @@ const AIImageStudio: React.FC = () => {
       await aiImageApi.deleteTask(taskId)
       message.success('已删除')
       fetchTasks(true, { page, keyword, status: statusFilter })
-    } catch {
-      message.error('删除失败')
+    } catch (e: any) {
+      message.error(e?.response?.data?.detail || '删除失败')
     }
   }
 
@@ -771,6 +864,25 @@ const AIImageStudio: React.FC = () => {
     if (task.aplus_type) setAplusType(task.aplus_type)
     else setAplusType('')
     setAplusCount(task.image_count || 1)
+    // 版式回填：从子项里取（同 key 去重），让「编辑/再做一单」保持同一批排版
+    {
+      const seen = new Set<string>()
+      const restored: AIImageLayout[] = []
+      ;(task.result_images || []).forEach((it) => {
+        const lay = it.layout
+        if (!lay?.key || seen.has(lay.key)) return
+        seen.add(lay.key)
+        restored.push({
+          key: lay.key,
+          id: lay.key.replace(/^\w+:/, ''),
+          name: lay.name || lay.key,
+          source: lay.source === 'upload' ? 'upload' : 'preset',
+          ratio_tag: lay.ratio_tag,
+          image_url: lay.image_url || undefined,
+        })
+      })
+      setLayouts(restored)
+    }
     if (Array.isArray(task.main_types)) {
       const typeList = task.main_types
       setSelectedMainTypes(typeList)
@@ -790,12 +902,13 @@ const AIImageStudio: React.FC = () => {
       })
     }
     else if (!task.aplus_type) {
-      // v1 旧记录：从 generation_types 里取主副图类型
-      const legacy = (task.generation_types || []).filter((t) => TYPE_LABEL_ALL[t])
+      // v1 旧记录：generation_types 里除 aplus 之外都是主副图类型（不再依赖前端标签表做白名单）
+      const legacy = (task.generation_types || []).filter((t) => t !== 'aplus')
       setSelectedMainTypes(legacy.length ? legacy : ['white_background', 'scene'])
     }
     setMainAspectRatio(task.main_aspect_ratio || task.aspect_ratio || '1:1')
     if (task.brand_settings) setBrand({ ...BRAND_DEFAULTS, ...task.brand_settings })
+    setBrandName(task.brand_settings?.brand_name || '')
     setProductInfo(task.product_info || '')
     setExtraPrompt(task.prompt || '')
     setActiveHistoryId(task.id)
@@ -874,6 +987,7 @@ const AIImageStudio: React.FC = () => {
           </Space>
           <Text style={{ display: 'block', fontSize: 12, marginTop: 4 }}>
             {item.label}
+            {item.layout?.name ? ` · ${item.layout.name}` : ''}
             {item.seq > 0 ? ` #${item.seq + 1}` : ''}
           </Text>
         </div>
@@ -928,6 +1042,7 @@ const AIImageStudio: React.FC = () => {
           <Tag>已取消</Tag>
           <Text type="secondary" style={{ fontSize: 12, marginTop: 8 }}>
             {item.label}
+            {item.layout?.name ? ` · ${item.layout.name}` : ''}
             {item.seq > 0 ? ` #${item.seq + 1}` : ''}
           </Text>
           <Button
@@ -958,6 +1073,7 @@ const AIImageStudio: React.FC = () => {
         <Spin size="small" />
         <Tag color={item.status === '生成中' ? 'processing' : 'default'}>
           {item.label}
+          {item.layout?.name ? ` · ${item.layout.name}` : ''}
           {item.seq > 0 ? ` #${item.seq + 1}` : ''} · {item.status}
         </Tag>
       </div>
@@ -970,18 +1086,18 @@ const AIImageStudio: React.FC = () => {
       (i) => i.status === '失败' || i.status === '已取消',
     )
 
-  /** 历史卡片的类型标签（v2 分组 + v1 兼容） */
+  /** 历史卡片的类型标签（v2 分组 + v1 兼容；标签取服务端 /options） */
   const renderTypeTags = (task: AIImageTask) => {
     const tags: string[] = []
     if (task.aplus_type) {
-      const a = APLUS_OPTIONS.find((o) => o.value === task.aplus_type)
+      const a = aplusOptions.find((o) => o.value === task.aplus_type)
       tags.push(a ? a.label : task.aplus_type)
     }
     if (Array.isArray(task.main_types) && task.main_types.length) {
-      tags.push(...task.main_types.map((t) => TYPE_LABEL_ALL[t] || t))
+      tags.push(...task.main_types.map((t) => mainTypeLabels[t] || t))
     } else if (task.main_types && typeof task.main_types === 'object') {
       tags.push(
-        ...Object.keys(task.main_types).map((t) => TYPE_LABEL_ALL[t] || t),
+        ...Object.keys(task.main_types).map((t) => mainTypeLabels[t] || t),
       )
     }
     if (!tags.length) {
@@ -1241,10 +1357,7 @@ const AIImageStudio: React.FC = () => {
                     value={brand.country}
                     onChange={(v) => setBrand((b) => ({ ...b, country: v }))}
                     showSearch
-                    options={[
-                      'US 美国', 'CA 加拿大', 'UK 英国', 'DE 德国', 'FR 法国',
-                      'IT 意大利', 'ES 西班牙', 'JP 日本', 'AU 澳大利亚',
-                    ].map((s) => ({ value: s, label: s }))}
+                    options={brandOptions.countries.map((s) => ({ value: s, label: s }))}
                   />
                 </Col>
                 <Col span={8}>
@@ -1255,9 +1368,7 @@ const AIImageStudio: React.FC = () => {
                     value={brand.language}
                     onChange={(v) => setBrand((b) => ({ ...b, language: v }))}
                     showSearch
-                    options={['英语', '德语', '法语', '意大利语', '西班牙语', '日语'].map(
-                      (s) => ({ value: s, label: s }),
-                    )}
+                    options={brandOptions.languages.map((s) => ({ value: s, label: s }))}
                   />
                 </Col>
                 <Col span={8}>
@@ -1267,9 +1378,7 @@ const AIImageStudio: React.FC = () => {
                     size="small"
                     value={brand.platform}
                     onChange={(v) => setBrand((b) => ({ ...b, platform: v }))}
-                    options={['亚马逊', 'eBay', '独立站', 'Temu', 'Shein'].map(
-                      (s) => ({ value: s, label: s }),
-                    )}
+                    options={brandOptions.platforms.map((s) => ({ value: s, label: s }))}
                   />
                 </Col>
               </Row>
@@ -1295,29 +1404,149 @@ const AIImageStudio: React.FC = () => {
                   style={{ width: '100%' }}
                 >
                   <Space direction="vertical" style={{ width: '100%' }} size={6}>
-                    {APLUS_OPTIONS.map((o) => (
-                      <Radio key={o.value} value={o.value} style={{ width: '100%' }}>
-                        <Space size={6}>
-                          <Text strong={aplusType === o.value}>{o.label}</Text>
-                          <Tag style={{ fontSize: 12 }}>{o.size}</Tag>
-                        </Space>
-                        <div style={{ paddingLeft: 24 }}>
-                          <Text type="secondary" style={{ fontSize: 12 }}>{o.desc}</Text>
-                        </div>
-                      </Radio>
-                    ))}
+                    {aplusOptions.length ? (
+                      aplusOptions.map((o) => (
+                        <Radio key={o.value} value={o.value} style={{ width: '100%' }}>
+                          <Space size={6}>
+                            <Text strong={aplusType === o.value}>{o.label}</Text>
+                            {o.size && <Tag style={{ fontSize: 12 }}>{o.size}</Tag>}
+                          </Space>
+                          {o.desc && (
+                            <div style={{ paddingLeft: 24 }}>
+                              <Text type="secondary" style={{ fontSize: 12 }}>{o.desc}</Text>
+                            </div>
+                          )}
+                        </Radio>
+                      ))
+                    ) : (
+                      <Text type="secondary" style={{ fontSize: 12 }}>
+                        加载 A+ 类型选项失败，请刷新页面重试
+                      </Text>
+                    )}
                   </Space>
                 </Radio.Group>
                 {aplusType && (
                   <div style={{ marginTop: 8 }}>
-                    <Text type="secondary" style={{ fontSize: 12 }}>生成张数</Text>
+                    {aplusType === 'aplus_banner' ? (
+                      <>
+                        {/* 品牌A+横幅：画面只有品牌名，AI 艺术字直出，不使用排版模板 */}
+                        <Text type="secondary" style={{ fontSize: 12 }}>
+                          品牌名（画面唯一文字，区分大小写）
+                        </Text>
+                        <Input
+                          value={brandName}
+                          onChange={(e) => setBrandName(e.target.value)}
+                          placeholder="例如 LaVenty"
+                          maxLength={20}
+                          showCount
+                          style={{ marginTop: 4 }}
+                        />
+                        <Text type="secondary" style={{ fontSize: 11, display: 'block', marginTop: 4 }}>
+                          仅英文品牌名（2–20 个字符）；背景、花纹、配色与字体气质跟随商品主图，画面不出现商品。
+                        </Text>
+                        <Text type="secondary" style={{ fontSize: 12, display: 'block', marginTop: 10 }}>
+                          生成张数
+                        </Text>
+                        <InputNumber
+                          min={1}
+                          max={4}
+                          value={aplusCount}
+                          onChange={(v) => setAplusCount(v || 1)}
+                          style={{ width: '100%', marginTop: 4 }}
+                        />
+                      </>
+                    ) : (
+                      <>
+                    {/* 版式：每种排版生成一张（对齐官方交互）。选了版式后张数由版式数决定 */}
+                    <div
+                      onClick={() => setLayoutOpen(true)}
+                      style={{
+                        display: 'flex', alignItems: 'center', gap: 10, cursor: 'pointer',
+                        padding: '8px 10px', borderRadius: 6, marginBottom: 10,
+                        border: `1px solid ${layouts.length ? token.colorPrimaryBorder : token.colorBorderSecondary}`,
+                        background: token.colorFillQuaternary,
+                      }}
+                    >
+                      <div
+                        style={{
+                          width: 26, height: 26, borderRadius: 5, flex: '0 0 26px',
+                          background: token.colorPrimaryBg, display: 'flex',
+                          alignItems: 'center', justifyContent: 'center',
+                        }}
+                      >
+                        <AppstoreOutlined style={{ color: token.colorPrimary, fontSize: 14 }} />
+                      </div>
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <Text style={{ fontSize: 12 }}>选择排版</Text>
+                        <div>
+                          <Text type="secondary" style={{ fontSize: 11 }}>
+                            {layouts.length
+                              ? `已选 ${layouts.length} 个 · 每种排版生成一张`
+                              : '未选 · 按官方排版随机生成'}
+                          </Text>
+                        </div>
+                      </div>
+                      <RightOutlined style={{ fontSize: 11, color: token.colorTextTertiary }} />
+                    </div>
+                    {layouts.length > 0 && (
+                      <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap', marginBottom: 8 }}>
+                        {layouts.map((l) => (
+                          <Tag
+                            key={l.key}
+                            closable
+                            onClose={(e) => {
+                              e.preventDefault()
+                              setLayouts(layouts.filter((x) => x.key !== l.key))
+                            }}
+                            style={{ margin: 0, fontSize: 11 }}
+                          >
+                            {l.name}
+                          </Tag>
+                        ))}
+                      </div>
+                    )}
+                    <Text type="secondary" style={{ fontSize: 12 }}>
+                      生成张数{layouts.length ? `（随版式，共 ${layouts.length} 张）` : ''}
+                    </Text>
                     <InputNumber
                       min={1}
                       max={4}
-                      value={aplusCount}
+                      value={layouts.length || aplusCount}
+                      disabled={layouts.length > 0}
                       onChange={(v) => setAplusCount(v || 1)}
                       style={{ width: '100%', marginTop: 4 }}
                     />
+                    {/* 无文字模式：默认开启。关闭后 PE 会自行排版英文文案（拼写/字重不可控，需人工复核） */}
+                    <div
+                      style={{
+                        marginTop: 10,
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'space-between',
+                        padding: '6px 10px',
+                        borderRadius: 6,
+                        border: `1px solid ${token.colorBorderSecondary}`,
+                        background: token.colorFillQuaternary,
+                      }}
+                    >
+                      <Space size={4}>
+                        <Text style={{ fontSize: 12 }}>无文字模式</Text>
+                        <Tooltip
+                          title="开启：画面内不出现任何文字，文案请在后期设计工具叠加（推荐，拼写与字体可控）。关闭：允许 AI 自行排版英文文案，需人工核对拼写。"
+                        >
+                          <QuestionCircleOutlined style={{ fontSize: 12, color: token.colorTextTertiary }} />
+                        </Tooltip>
+                      </Space>
+                      <Switch
+                        size="small"
+                        checked={brand.text_mode !== 'with_text'}
+                        onChange={(checked) =>
+                          setBrand((b) => ({ ...b, text_mode: checked ? 'no_text' : 'with_text' }))
+                        }
+                      />
+                    </div>
+                      </>
+                    )}
                   </div>
                 )}
               </Card>
@@ -1343,11 +1572,18 @@ const AIImageStudio: React.FC = () => {
                   <div>
                     <Text type="secondary" style={{ fontSize: 12 }}>生成类型（多选）</Text>
                     <div style={{ marginTop: 8 }}>
-                      {Object.entries(MAIN_TYPE_LABELS).map(([key, label]) => {
-                        const isScene = key === 'scene'
+                      {mainTypeRows.length === 0 && (
+                        <Text type="secondary" style={{ fontSize: 12 }}>
+                          加载生成类型选项失败，请刷新页面重试
+                        </Text>
+                      )}
+                      {mainTypeRows.map(([key, typeLabel]) => {
+                        const isScene = !!sceneParentKey && key === sceneParentKey
+                        // 场景图父项只承载两条子路径，标签/说明由服务端下发
+                        const label = isScene ? sceneGroup?.label || typeLabel : typeLabel
                         // 场景图：父项是否"开启"取决于两个子路径里有没有选中的
                         const sceneSubs = isScene
-                          ? SCENE_VARIANTS.filter((v) => selectedMainTypes.includes(v.key))
+                          ? sceneVariants.filter((v) => selectedMainTypes.includes(v.key))
                           : []
                         const checked = isScene ? sceneSubs.length > 0 : selectedMainTypes.includes(key)
                         const toggleRow = () => {
@@ -1355,8 +1591,8 @@ const AIImageStudio: React.FC = () => {
                             // 未开启 → 默认勾「不带人物」；已开启 → 收起并清空两条子路径
                             setSelectedMainTypes((prev) =>
                               checked
-                                ? prev.filter((t) => !SCENE_VARIANT_KEYS.includes(t))
-                                : [...prev.filter((t) => !SCENE_VARIANT_KEYS.includes(t)), 'scene'],
+                                ? prev.filter((t) => !sceneVariantKeys.includes(t))
+                                : [...prev.filter((t) => !sceneVariantKeys.includes(t)), 'scene'],
                             )
                             return
                           }
@@ -1381,7 +1617,7 @@ const AIImageStudio: React.FC = () => {
                             >
                               <Space size={8}>
                                 <Checkbox checked={checked} />
-                                <Tooltip title={MAIN_TYPE_DESCRIPTIONS[key]}>
+                                <Tooltip title={isScene ? sceneGroup?.hint : mainTypeDescriptions[key]}>
                                   <Text strong={checked}>{label}</Text>
                                 </Tooltip>
                                 {isScene && (
@@ -1410,7 +1646,7 @@ const AIImageStudio: React.FC = () => {
                                   borderLeft: `2px solid ${token.colorPrimaryBorder}`,
                                 }}
                               >
-                                {SCENE_VARIANTS.map((v) => {
+                                {sceneVariants.map((v) => {
                                   const sub = selectedMainTypes.includes(v.key)
                                   return (
                                     <div
@@ -1567,7 +1803,7 @@ const AIImageStudio: React.FC = () => {
             {totalSheets > 0
               ? `立即生成（共 ${totalSheets} 张：${
                   [
-                    aplusType && `A+×${aplusCount}`,
+                    aplusType && `A+×${aplusSheets}`,
                     mainEnabled && activeMainTypeCount > 0 && `主副图×${totalSheets - (aplusType ? aplusCount : 0)}`,
                   ]
                     .filter(Boolean)
@@ -1782,6 +2018,15 @@ const AIImageStudio: React.FC = () => {
                                 {(task.result_images || []).filter((i) => i.status === '已完成').length}
                                 /{(task.result_images || []).length} 已完成…
                               </Text>
+                              {/* 排队排位：ComfyUI 与超分/视频共用串行队列，不给提示会像卡死 */}
+                              {task.queue?.hint && (
+                                <div style={{ marginTop: 2 }}>
+                                  <Text type="secondary" style={{ fontSize: 11 }}>
+                                    <ClockCircleOutlined style={{ marginRight: 4 }} />
+                                    {task.queue.hint}
+                                  </Text>
+                                </div>
+                              )}
                             </div>
                           ) : task.status === '失败' ? (
                             <div style={{ marginTop: 2 }}>
@@ -2143,6 +2388,9 @@ const AIImageStudio: React.FC = () => {
                     { label: '生成状态：', value: item.status },
                     { label: '生成者：', value: task.creator_name || '-' },
                     { label: '生成类型：', value: item.label || '-' },
+                    ...(item.layout?.name
+                      ? [{ label: '版式：', value: `${item.layout.name}${item.layout.source === 'upload' ? '（上传）' : ''}` }]
+                      : []),
                     {
                       label: '生成比例：',
                       value: sizeText || task.main_aspect_ratio || task.aspect_ratio || '-',
@@ -2150,6 +2398,14 @@ const AIImageStudio: React.FC = () => {
                     { label: '销售国家/地区：', value: task.brand_settings?.country || '未设置' },
                     { label: '生成图片语言：', value: task.brand_settings?.language || '未设置' },
                     { label: '发布平台：', value: task.brand_settings?.platform || '未设置' },
+                    ...(task.aplus_type
+                      ? [{
+                          label: '画面文字：',
+                          value: task.brand_settings?.text_mode === 'with_text'
+                            ? '允许 AI 排版文案（需复核拼写）'
+                            : '无文字（后期设计工具叠加）',
+                        }]
+                      : []),
                     { label: '商品信息：', value: task.product_info || '-' },
                   ].map((row) => (
                     <div key={row.label} style={{ marginBottom: 16 }}>
@@ -2303,6 +2559,14 @@ const AIImageStudio: React.FC = () => {
         source="ai_image"
         taskTitle={bindTarget?.title}
         onClose={() => setBindTarget(null)}
+      />
+
+      <AIImageLayoutPicker
+        open={layoutOpen}
+        value={layouts.map((l) => l.key)}
+        limit={maxLayouts}
+        onClose={() => setLayoutOpen(false)}
+        onConfirm={(_keys, items) => setLayouts(items)}
       />
     </div>
     </>

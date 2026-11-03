@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import random
+import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -71,11 +72,19 @@ RATIO_VALUES: Dict[str, float] = {
 #   （旧配置 16:9(1.79) 需裁掉 26% 高度，主体/A+ 文案会被切）
 APLUS_SPECS: Dict[str, Dict[str, Any]] = {
     "aplus_advanced": {"label": "高级A+图", "gen_ratio": "21:9", "target_size": (1464, 600),
-                       "megapixels": 1.0},
+                       "megapixels": 1.0,
+                       "desc": "超宽幅品牌横幅，A+ 页面顶部大图"},
     "aplus_normal":   {"label": "普通A+图", "gen_ratio": "16:9", "target_size": (970, 600),
-                       "megapixels": 0.8},
+                       "megapixels": 0.8,
+                       "desc": "标准 A+ 页面横幅"},
     "aplus_mobile":   {"label": "手机A+图", "gen_ratio": "4:3",  "target_size": (600, 450),
-                       "megapixels": 0.5},
+                       "megapixels": 0.5,
+                       "desc": "移动端 A+ 图，小屏浏览"},
+    # 品牌A+横幅（970×300 = 3.23:1）：现有 ResolutionSelector 无此比例，
+    # 由专用工作流自定义 EmptyLatent（1888×576 ≈ 3.28:1）生成后轻微裁剪到 970×300。
+    "aplus_banner":   {"label": "品牌A+横幅", "gen_ratio": "21:9", "target_size": (970, 300),
+                       "megapixels": 1.1,
+                       "desc": "画面只有品牌名（AI 艺术字），风格跟随商品主图；不使用排版模板"},
 }
 # 主副图类型（多选）
 # scene 与 scene_person 是「同一类型的两个变体」：scene 保留旧 key（历史任务回填依赖它），
@@ -87,6 +96,27 @@ MAIN_GEN_TYPES: Dict[str, str] = {
     "scene_person": "场景图（带人物）",
     "closeup": "特写图",
     "closeup_white": "特写白底图",
+}
+# 主副图卡片的一句话说明（/options 下发，前端不再各写一份）
+MAIN_TYPE_DESCRIPTIONS: Dict[str, str] = {
+    "selling_point": "商品置于卖点匹配的场景，配文字排版展示卖点",
+    "white_background": "商品精修后放置于纯白色背景",
+    "closeup": "与卖点匹配的局部特写细节",
+    "closeup_white": "白底局部特写细节",
+}
+# 场景图在 UI 上是一个父项 + 两条子路径：父项不直接对应生成类型，
+# 勾选状态由子路径（scene/scene_person）决定；这里的 key/label/hint 一并下发，
+# 避免前端再维护一份易与后端脱节的文案。
+SCENE_GROUP: Dict[str, Any] = {
+    "key": "scene",
+    "label": "场景图",
+    "hint": "商品置于真实使用场景，可展开选择带人物 / 不带人物",
+    "variants": [
+        {"key": "scene", "label": "场景图（不带人物）",
+         "hint": "商品置于真实使用场景，画面中不出现任何人物"},
+        {"key": "scene_person", "label": "场景图（带人物）",
+         "hint": "成年模特按使用方式佩戴/使用商品；严禁儿童"},
+    ],
 }
 # 品牌自定义设置选项（前端下拉用）
 BRAND_OPTIONS: Dict[str, List[str]] = {
@@ -161,6 +191,158 @@ NODE_SAVE = "487"          # SaveImage，输入 filename_prefix
 NODE_ENCODE = "497"        # TextEncodeQwenImage21，多图走 images.image_1..image_N（AUTOGROW）
 NODE_PE = "565"            # TE_Qwen_Image_2_1_Prompt_Enhancer，多图走 图片/图片2..图片8
 NODE_SCALE = "532"         # ImageScaleToTotalPixels，参考图统一到同一像素尺度
+NODE_CONTRACT = "572"      # A+ append 变体：版式契约节点（PE 之后拼接，PE 改写不到）
+
+# A+ 提示词通道实验（2026-10-29）：空=现有链路；direct=跳过 PE；append=PE 后强制拼接版式契约
+APLUS_PROMPT_MODES = ("", "direct", "append")
+_APLUS_WORKFLOW_FILES = {
+    "direct": "qwen_image_workflow_aplus_direct.json",
+    "append": "qwen_image_workflow_aplus_append.json",
+}
+
+# zones 类型 → 分区中文名（无字/有字两套措辞）
+_ZONE_TYPE_LABELS_NOTEXT = {
+    "img": "商品图区", "txt": "留白区", "band": "留白横带", "gap": "背景间隙",
+}
+_ZONE_TYPE_LABELS_TEXT = {
+    "img": "商品图区", "txt": "标题文字区", "band": "信息条（可排文案）", "gap": "背景间隙",
+}
+
+# 商品图区的场景类型槽位（2026-10-30 P3）：不写死具体场地，
+# 只给「使用中 / 环境中 / 陈列细节」三类语义，具体环境与道具由 PE 按商品用途推导。
+# 同一版式里多个 img 区按此顺序轮换，避免三列全是同一种构图。
+_SCENE_SLOT_ORDER = ("usage", "context", "display")
+_SCENE_SLOT_HINTS = {
+    "usage": "商品正在被使用，人物或手部与商品自然互动",
+    "context": "商品在由用途推导的真实环境中自然摆放，背景与陈设服务于主题",
+    "display": "商品陈列位或细节特写，突出材质、工艺或关键细节",
+}
+
+
+def _resolve_aplus_workflow() -> Optional[str]:
+    """按 IMAGE_APLUS_PROMPT_MODE 解析 A+ 专用工作流路径；未启用返回 None。
+
+    模式非法或文件缺失立即报错（配置错误要在提交期暴露，不能静默回退旧链路）。
+    """
+    mode = (getattr(settings, "IMAGE_APLUS_PROMPT_MODE", "") or "").strip().lower()
+    if not mode:
+        return None
+    if mode not in APLUS_PROMPT_MODES:
+        raise AIImageError(
+            f"IMAGE_APLUS_PROMPT_MODE 配置非法: {mode!r}（可选 {'/'.join(APLUS_PROMPT_MODES)}）"
+        )
+    # 与 IMAGE_WORKFLOW_PATH 同目录：无论从哪个工作目录启动都正确
+    path = os.path.join(
+        os.path.dirname(os.path.abspath(settings.IMAGE_WORKFLOW_PATH)),
+        _APLUS_WORKFLOW_FILES[mode],
+    )
+    if not os.path.isfile(path):
+        raise AIImageError(f"A+ 工作流文件缺失: {path}")
+    return path
+
+
+def _pct(v: float) -> str:
+    return f"{round(float(v) * 100):g}%"
+
+
+def _zones_to_clause(zones: List[Dict[str, Any]], canvas: Tuple[int, int],
+                     no_text: bool) -> str:
+    """zones 坐标 → 机器可读的分区约束串（官方预设带 zones 时优先用它）。
+
+    zones 是 0–1 归一化坐标（x/y 左上角 + w/h + t 类型），与画布尺寸解耦：
+    同一版式可适配 advanced/normal/mobile 三种画布。
+    """
+    labels = _ZONE_TYPE_LABELS_NOTEXT if no_text else _ZONE_TYPE_LABELS_TEXT
+    lines = [f"目标画布 {canvas[0]}×{canvas[1]}。", "画面分区（百分比坐标，左上角为原点，逐条执行）："]
+    img_index = 0
+    for i, z in enumerate(zones, start=1):
+        t = z.get("t") or "img"
+        label = labels.get(t, "商品图区")
+        line = (
+            f"{i}. {label}：x {_pct(z.get('x', 0))}–{_pct(z.get('x', 0) + z.get('w', 0))}，"
+            f"y {_pct(z.get('y', 0))}–{_pct(z.get('y', 0) + z.get('h', 0))}"
+        )
+        if t == "img":
+            slot = _SCENE_SLOT_ORDER[img_index % len(_SCENE_SLOT_ORDER)]
+            img_index += 1
+            line += f"；场景类型 {slot}（{_SCENE_SLOT_HINTS[slot]}）"
+            # P4：zones 只描述几何/场景；组件展示由 571 的 coverage_plan 决定。
+            # 仅当版式数据显式给出覆盖策略时才写进契约。
+            coverage = z.get("product_coverage") or z.get("coverage")
+            if coverage:
+                line += f"；商品覆盖 {coverage}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _layout_contract(lay: Optional[Dict[str, Any]], aplus_type: str,
+                     no_text: bool) -> Optional[str]:
+    """A+ 子项的最终版式契约（append 模式写入 572，PE 之后拼接，PE 改写不到）。
+
+    官方预设优先用 zones 坐标生成；没有 zones（如 DB 官方模板/上传版式）退回
+    structure 文本（无字模式下先做同一套清洗）。都没有 → 返回 None，调用方
+    回退旧链路，绝不静默地空转契约。
+
+    2026-10-29 对标真实 A+ 成品补两条正向语言（此前产出是「白底陈列」，差距在）：
+    1. 商品图区 = 真实使用场景摄影（不是白底棚拍/简单陈列）；
+    2. 各图区呈现为圆角照片卡片（无字清洗摘掉了「圆角/卡片」，这里正向补回——
+       之前的「禁边框/禁卡片」只该约束留白区，不该错杀图区的设计语言）。
+
+    2026-10-30 P3：删除「家居/卧室/桌面」等固定场地枚举，改为场景类型槽位
+    （usage/context/display），环境与道具由 PE 按商品用途推导；并声明契约优先级
+    高于前述任何风格描述。卡片规则只作用于商品图区，留白区仍禁卡片/边框。
+    """
+    if not lay:
+        return None
+    spec = APLUS_SPECS.get(aplus_type) or {}
+    canvas = tuple(spec.get("target_size") or (1464, 600))
+    zones = lay.get("zones") or []
+    if zones:
+        body = _zones_to_clause(zones, canvas, no_text)
+    else:
+        structure = (lay.get("structure") or "").strip()
+        if not structure:
+            return None
+        if no_text:
+            structure = _sanitize_structure_no_text(structure)
+        slot_cycle = " / ".join(
+            f"{s}（{_SCENE_SLOT_HINTS[s]}）" for s in _SCENE_SLOT_ORDER
+        )
+        body = (
+            f"目标画布 {canvas[0]}×{canvas[1]}。\n"
+            f"画面分区（位置与占比必须遵守）：{structure}\n"
+            f"各商品图区按场景类型轮换：{slot_cycle}；具体环境、陈设与道具由商品用途推导。"
+        )
+    if no_text:
+        rule = (
+            "【约束优先级（高→低）】1 商品真实性与件数；2 分区位置、数量与比例；"
+            "3 无文字规则；4 各分区的场景类型与商品覆盖；"
+            "5 在上述约束内，采用前述 PE 输出的视觉主题、色彩、场景与摄影方案。"
+            "商品覆盖按 571 的 coverage_plan / zone_assignments 执行：每个分区只展示该区指定的组件；"
+            "全局组件数量以事实卡 components 为准，不得改变；同一组件在不同分区重复出现属于展示性重复，"
+            "不等于增加实际数量；不得为了满足每个分区而重复整套商品；不得遗漏 coverage_plan 要求覆盖的组件。"
+            "每个商品图区都是一张独立的真实商业场景摄影，禁止退化为白底商品陈列，"
+            "也不得把参考图的白底拼贴背景、原始排列或原图构图复刻进画面；"
+            "各图区场景可不同，但整体主题、色彩与摄影语言必须统一。"
+            "各商品图区呈现为带圆角的独立照片卡片，卡片之间是均匀的背景间隙；"
+            "该卡片规则只适用于商品图区，不适用于留白区。"
+            "留白区/间隙只允许背景自然延伸，不得出现商品、文字、色块、卡片、边框或阴影分界。"
+            "不得新增、删除、移动或合并分区。"
+        )
+    else:
+        rule = (
+            "【约束优先级（高→低）】1 商品真实性与件数；2 分区位置、数量与比例；"
+            "3 各分区的场景类型与商品覆盖；"
+            "4 在上述约束内，采用前述 PE 输出的视觉主题、色彩、场景与摄影方案。"
+            "商品覆盖按 571 的 coverage_plan / zone_assignments 执行；全局组件数量以事实卡 components 为准，"
+            "不得改变；展示性重复不等于增加实际数量；不得为了覆盖而重复整套商品。"
+            "每个商品图区都是一张独立的真实商业场景摄影，场景与环境由商品用途推导；"
+            "各图区场景可不同，但整体主题、色彩与摄影语言必须统一。"
+            "各商品图区呈现为带圆角的独立照片卡片，卡片之间是均匀的背景间隙；"
+            "该卡片规则只适用于商品图区。"
+            "不得新增、删除、移动或合并分区。"
+        )
+    return f"【最终版式约束 —— 优先级最高，逐条执行】\n{body}\n{rule}"
 
 # 参考图上限：受 PE 节点可选输入约束（图片/图片2..图片8 共 8 个通道）。
 # 编码器 images 通道虽支持 image_1..image_16，但第 9 张进不了 PE，故上限取 8。
@@ -184,8 +366,14 @@ _cancel_flags: set = set()
 # 旧线程跑完仍会写回「已完成」，覆盖重试的成果。
 _run_tokens: Dict[int, int] = {}
 
-# 用户级提交锁：「查有无活跃任务 → 插入新任务」是 check-then-insert，
-# 双开页面/并发请求下两边都查不到活跃任务，会各自建单（用户级并发 1 失效）。
+# 用户级排队：同一用户同时只执行一单，后续提交进入队列等待（不再拒绝提交）。
+# 队列保存在进程内（含参考图字节），服务重启后未启动的排队任务由
+# resume_pending_tasks 判失败并提示重新提交（与既有重启口径一致）。
+_pending_by_user: Dict[int, List[Tuple[int, Dict[str, Any]]]] = {}
+_task_owner: Dict[int, int] = {}
+_user_current: Dict[int, int] = {}
+
+# 用户级提交锁：「查/插 + 入队」是 check-then-act，双开页面/并发请求下会各建一单。
 # 进程内锁对单 worker 足够；多 worker 需换 DB 唯一约束（同幂等实现备注）。
 _user_submit_locks: Dict[int, threading.Lock] = {}
 _user_locks_guard = threading.Lock()
@@ -221,8 +409,235 @@ def _clear_cancel(task_id: int) -> None:
         _cancel_flags.discard(task_id)
 
 
+def _claim_task_slot(task_id: int) -> bool:
+    """抢占任务执行槽：同一任务同一时刻只允许一个后台线程。
+
+    check-then-act 必须原子：否则「重试」与「旧线程收尾」交错时，
+    两边都判断为无人执行，导致同一批图重复生成或新提交的子项无人轮询。
+    """
+    with _lock:
+        if task_id in _running:
+            return False
+        _running.add(task_id)
+        return True
+
+
+def _release_task_slot(task_id: int) -> None:
+    """释放任务执行槽，并启动该用户队列里的下一单（如果有）。
+
+    用户级排队：同一用户同时只跑一单，其余任务保持「排队中」等待。
+    """
+    advance_user: Optional[int] = None
+    with _lock:
+        _running.discard(task_id)
+        owner = _task_owner.pop(task_id, None)
+        if owner is not None and _user_current.get(owner) == task_id:
+            _user_current.pop(owner, None)
+            advance_user = owner
+    if advance_user is not None:
+        _advance_user_queue(advance_user)
+
+
+def _register_task_run(task_id: int, user_id: int, prep_kwargs: Dict[str, Any]) -> bool:
+    """登记任务归属：返回 True=当前空闲可立即启动；False=已进入该用户队列。
+
+    必须在插入 DB 记录之后调用；排队任务的参考图字节留在内存，等前序任务结束后启动。
+    """
+    with _lock:
+        _task_owner[task_id] = user_id
+        if _user_current.get(user_id) is None:
+            _user_current[user_id] = task_id
+            return True
+        _pending_by_user.setdefault(user_id, []).append((task_id, prep_kwargs))
+        return False
+
+
+def _mark_task_resumed(task_id: int, user_id: int) -> None:
+    """重启恢复的任务也要登记用户归属，避免新提交绕过队列与恢复任务并发"""
+    with _lock:
+        _task_owner[task_id] = user_id
+        _user_current.setdefault(user_id, task_id)
+
+
+def _queued_task_startable(task_id: int) -> bool:
+    """排队中的任务是否仍可启动：被取消/删除的任务直接跳过"""
+    _ensure_models_loaded()
+    from database.database import SessionLocal
+    from models.ai_image_task import AIImageTask
+
+    db = SessionLocal()
+    try:
+        row = (
+            db.query(AIImageTask.status, AIImageTask.deleted_at)
+            .filter(AIImageTask.id == task_id)
+            .first()
+        )
+    finally:
+        db.close()
+    return bool(row) and row[0] == "排队中" and row[1] is None
+
+
+def _advance_user_queue(user_id: int) -> None:
+    """启动该用户队列里的下一单（一次只启动一单，其余继续排队）"""
+    while True:
+        with _lock:
+            if _user_current.get(user_id) is not None:
+                return
+            pending = _pending_by_user.get(user_id) or []
+            if not pending:
+                _pending_by_user.pop(user_id, None)
+                return
+            task_id, prep_kwargs = pending.pop(0)
+            _user_current[user_id] = task_id
+            _running.add(task_id)
+
+        if not _queued_task_startable(task_id):
+            with _lock:
+                if _user_current.get(user_id) == task_id:
+                    _user_current.pop(user_id, None)
+                _running.discard(task_id)
+                _task_owner.pop(task_id, None)
+            continue
+
+        try:
+            threading.Thread(
+                target=_prepare_and_run, args=(task_id,), kwargs=prep_kwargs,
+                daemon=True, name=f"ai-image-task-{task_id}",
+            ).start()
+        except Exception:
+            logger.exception(f"[AI生图] 队列任务 {task_id} 启动失败")
+            with _lock:
+                _running.discard(task_id)
+                _user_current.pop(user_id, None)
+                _task_owner.pop(task_id, None)
+            continue
+        logger.info(f"[AI生图] 用户 {user_id} 队列启动任务 {task_id}")
+        return
+
+
 # ComfyUI 串行队列：限制本服务同时轮询的任务数，与生视频互让
 _slot_sem = threading.Semaphore(max(1, int(settings.IMAGE_MAX_CONCURRENT_TASKS)))
+
+
+def _comfy_queue_depth() -> Optional[int]:
+    """ComfyUI 当前队列深度（running + pending）；接口不可用时返回 None"""
+    try:
+        q = _api("GET", "/queue", timeout=10).json()
+        return len(q.get("queue_running") or []) + len(q.get("queue_pending") or [])
+    except Exception:
+        return None
+
+
+# 队列快照缓存：列表页 5s 轮询一次，10 条进行中任务不该触发 10 次 /queue 查询
+_QUEUE_SNAPSHOT_TTL = 3.0
+_queue_snapshot: Dict[str, Any] = {"at": 0.0, "data": None}
+_queue_snapshot_lock = threading.Lock()
+
+
+def _comfy_queue_state() -> Dict[str, Any]:
+    """ComfyUI 队列快照：{ok, running, pending, positions{pid: 1 基排位}}"""
+    with _queue_snapshot_lock:
+        cached = _queue_snapshot.get("data")
+        if cached is not None and time.time() - float(_queue_snapshot.get("at") or 0) < _QUEUE_SNAPSHOT_TTL:
+            return cached
+    data: Dict[str, Any] = {"ok": False, "running": 0, "pending": 0, "positions": {}}
+    try:
+        q = _api("GET", "/queue", timeout=4).json()
+        pending = q.get("queue_pending") or []
+        positions: Dict[str, int] = {}
+        for i, entry in enumerate(pending):
+            pid = entry[1] if isinstance(entry, (list, tuple)) and len(entry) > 1 else None
+            if pid:
+                positions[str(pid)] = i + 1
+        data = {
+            "ok": True,
+            "running": len(q.get("queue_running") or []),
+            "pending": len(pending),
+            "positions": positions,
+        }
+    except Exception:
+        pass  # ComfyUI 忙时查不到就退化为「无排位提示」，不影响任务本身
+    with _queue_snapshot_lock:
+        _queue_snapshot["at"] = time.time()
+        _queue_snapshot["data"] = data
+    return data
+
+
+def _queue_info(task) -> Optional[Dict[str, Any]]:
+    """进行中任务的队列排位（前端展示「前面还有 N 个任务」）。
+
+    relay 任务不占 ComfyUI 队列；本地任务分两段等待：①同账号用户级排队
+    ②ComfyUI 队列（running + pending）。两段都可能把「排队中」拖到几十分钟，
+    不给提示用户只会以为是卡死。
+    """
+    if task is None or task.status not in ("排队中", "生成中"):
+        return None
+    if (getattr(task, "provider", None) or "local") == "relay":
+        return {"stage": "relay", "ahead": None, "hint": ""}
+
+    user_ahead = 0
+    with _lock:
+        queued_ids = [tid for tid, _ in (_pending_by_user.get(task.user_id) or [])]
+        if task.id in queued_ids:
+            # 队列里排在本单之前的单数 + 正在执行的那一单（若存在且不是自己）
+            user_ahead = queued_ids.index(task.id)
+            current = _user_current.get(task.user_id)
+            if current is not None and current != task.id:
+                user_ahead += 1
+        elif _user_current.get(task.user_id) not in (None, task.id):
+            user_ahead = 1
+
+    state = _comfy_queue_state()
+    position: Optional[int] = None
+    if state.get("ok"):
+        for pid in _read_json_list(task.comfy_prompt_ids):
+            pos = (state.get("positions") or {}).get(str(pid))
+            if pos:
+                position = pos if position is None else min(position, pos)
+
+    ahead = position - 1 if position else 0
+    if user_ahead:
+        hint = f"同账号前面还有 {user_ahead} 单在跑"
+        if ahead:
+            hint += f"；ComfyUI 队列前面还有 {ahead} 个任务"
+    elif ahead:
+        hint = f"ComfyUI 队列前面还有 {ahead} 个任务"
+    elif state.get("ok") and task.status == "排队中":
+        hint = "已进入 ComfyUI 队列，等待开始"
+    else:
+        hint = ""
+
+    return {
+        "stage": "comfy",
+        "ahead": ahead,
+        "position": position,
+        "user_ahead": user_ahead,
+        "comfy_running": state.get("running"),
+        "comfy_pending": state.get("pending"),
+        "hint": hint,
+    }
+
+
+def _wait_comfy_queue_slot(task_id: int) -> None:
+    """提交工作流前的背压：队列过深时先等位。
+
+    原实现只把「轮询」纳入信号量，提交阶段在闸门外；多用户并发时 12 张 × N
+    会瞬间灌满 ComfyUI 队列，挤占生视频/超分。等待有上限，超时仍提交，
+    避免队列长期高位时整单无限阻塞。
+    """
+    limit = max(1, int(settings.IMAGE_MAX_QUEUE_DEPTH))
+    deadline = time.time() + max(0, int(settings.IMAGE_QUEUE_WAIT_SECONDS))
+    waited = False
+    while time.time() < deadline:
+        depth = _comfy_queue_depth()
+        if depth is None or depth < limit:
+            if waited:
+                logger.info(f"[AI生图] 任务 {task_id} 队列已回落（深度 {depth}），继续提交")
+            return
+        waited = True
+        time.sleep(3)
+    logger.warning(f"[AI生图] 任务 {task_id} 等待队列回落超时，继续提交以避免整单卡死")
+
 
 _MODELS_LOADED = False
 
@@ -423,6 +838,33 @@ def _normalize_for_comfy(content: bytes) -> bytes:
 _MIN_MAIN_IMAGE_SIDE = 512
 
 
+def _fetch_url_bytes(url: str, limit: int = 10 * 1024 * 1024) -> bytes:
+    """下载素材图（版式参考图存 TOS，只存了 URL，生成时按需取回）
+
+    直连：本机/服务器若配了 http_proxy，走代理取自家 CDN 会被隧道抖动拖到超时
+    （与 ZIP 打包同款问题，见 build_task_zip 的 trust_env=False）。
+    """
+    if not url:
+        raise AIImageError("版式图地址为空")
+    try:
+        sess = requests.Session()
+        sess.trust_env = False
+        resp = sess.get(url, timeout=20, stream=True)
+        resp.raise_for_status()
+        buf = bytearray()
+        for chunk in resp.iter_content(65536):
+            buf.extend(chunk)
+            if len(buf) > limit:
+                raise AIImageError("版式图超过 10MB")
+        if not buf:
+            raise AIImageError("版式图为空")
+        return bytes(buf)
+    except AIImageError:
+        raise
+    except Exception as e:
+        raise AIImageError(f"版式图下载失败: {e}")
+
+
 def _image_area(content: bytes) -> int:
     """参考图像素数；解码失败返回 0（按最不清晰处理）"""
     try:
@@ -491,68 +933,338 @@ def _load_prompt_templates() -> Dict[str, Dict[str, str]]:
         raise AIImageError(f"读取提示词模板失败: {e}")
 
 
-# 带人物场景的差异化矩阵（中文版，本地链路用）：按 seq 轮换，
-# 只描述构图/姿态/光线（与商品无关的部分），**不指定环境**——场景主题交给 PE
-# 按「商品风格」自行设计（2026-10-26 裁定：环境指定曾导致草莓书包配石柱廊）。
-PERSON_VARIATIONS_CN: List[Dict[str, str]] = [
-    {
-        "framing": "半身，正面 3/4 角度",
-        "pose": "站姿自然，一只手垂在体侧，另一只手轻触商品所在位置",
-        "light": "左侧低角度晨光，发丝带柔和轮廓光",
-    },
-    {
-        "framing": "七分身，行走中",
-        "pose": "迈步向前，手臂自然摆动，商品随动作显出且不被遮挡",
-        "light": "黄昏逆光，头发边缘发光，空气略带薄雾",
-    },
-    {
-        "framing": "近景（胸部以上到商品所在部位的局部）",
-        "pose": "侧脸低头，一只手抬起整理商品，动作自然不做作",
-        "light": "阴天柔和侧光，方向明确，均匀照亮材质纹理与金属件",
-    },
-    {
-        "framing": "3/4 背面回眸",
-        "pose": "转身回看镜头，一只手抬起轻搭在商品所在位置",
-        "light": "暖色轮廓光勾出肩背剪影边缘",
-    },
+def _multi_shot_types(gen_plan) -> set:
+    """哪些类型在同一任务里要出多张（只有它们需要“彼此不同”的提示）"""
+    counts: Dict[str, int] = {}
+    for row in gen_plan:
+        t = row[0]
+        counts[t] = counts.get(t, 0) + 1
+    return {t for t, n in counts.items() if n > 1}
+
+
+# 画面文字条款（A+ 模板的 {text_clause} 占位）。
+# 2026-10-28 PE 探针实测：光写「禁止文字」PE 会照搬且不诱发写字；但只剩禁止、没有正向版面目标时，
+# 它会退化成「纯白背景」来满足约束——所以条款必须配正向版面红线（见 aplus_advanced 模板）。
+_NO_TEXT_CLAUSE = (
+    "禁止：画面内出现任何可读的文字、字母、数字、价签、水印、社媒标识或 logo；"
+    "商品自带的字母与图案不算文字，必须逐字保留。"
+)
+_TEXT_OK_CLAUSE = (
+    "画面可出现排版文字：只允许品牌文案，语言按目标市场，不出现价签、水印、社媒标识或 logo。"
+)
+# 品牌A+横幅文字条款（{text_clause} 占位）：品牌名由 571 直接给出，这里只声明「不得自造文字」。
+# （2026-11-02 A/B 实测后用户裁定：572 后置合约已去除，品牌名进 571 即可。）
+_BANNER_TEXT_CLAUSE = (
+    "画面中只允许出现后置指令指定的品牌名（即「品牌名：」一行给出的名称）；"
+    "不要自行编写任何品牌名、字母、数字、标语，也不要绘制文字占位或字形图案；"
+    "除该品牌名外，画面禁止任何文字、字母、数字、价签、水印、社媒标识或 logo。"
+)
+
+# 品牌名（英文）：字母/数字/空格与常见商标符号，2–20 字符，保留大小写。
+# 只用于「品牌A+横幅」的必填校验，其他 A+ 类型不读取也不校验。
+_BRAND_NAME_RE = re.compile(r"^[A-Za-z0-9&'\-., ]+$")
+_BRAND_NAME_MIN = 2
+_BRAND_NAME_MAX = 20
+
+
+def _normalize_brand_name(value: Optional[str]) -> str:
+    """规范化并校验英文品牌名；空值返回 ""，非法值抛 AIImageError。
+
+    只做空白归一（多空格压成一个、去首尾），**不改大小写**——用户指定的大小写
+    会原样写进 571 提示词，PE 与模型都不得改变文字内容（字形可艺术化设计）。
+    """
+    name = " ".join(str(value or "").split())
+    if not name:
+        return ""
+    if not (_BRAND_NAME_MIN <= len(name) <= _BRAND_NAME_MAX):
+        raise AIImageError(
+            f"品牌名长度需为 {_BRAND_NAME_MIN}–{_BRAND_NAME_MAX} 个字符（仅英文品牌名）"
+        )
+    if not _BRAND_NAME_RE.match(name) or not re.search(r"[A-Za-z]", name):
+        raise AIImageError("品牌名仅支持英文字母、数字与 & ' - . , 空格（区分大小写）")
+    return name
+
+# 无文字模式下，版式结构描述里的「标题/文案/文字区」等词会直接诱发模型画字形
+# （2026-10-29 实测：正向「留白」指令也压不住，出乱码标题）——
+# 生成时把这些词统一改写为「留白」，数据库里的原始描述不动（运营仍按真实版式阅读）。
+# 2026-10-29 用户裁定：不要「留白块/留白条」这类名词 —— 它们暗示一个可见的矩形块，
+# 实测顶部留白会被画成一块浅色空矩形。
+# 做法：位置词统一缩成「留白」，含义由 aplus_layout 模板里的 {layout_text_rule} 定义一次
+# （「与背景连续的整片留白…不留任何矩形色块」）。**不要在这里再追加一份定义**：
+# 2026-10-29 实测结构段末尾 + 文字规则两处各写一遍，同一句话重复出现，只增加噪声。
+# 也不要在每个位置后面拖长定语（「一句短与背景连续的整片留白的位置」这类句子已不通）。
+_NO_TEXT_STRUCTURE_REPLACEMENTS: List[Tuple[str, str]] = [
+    # 长复合词必须排在短词前面：`标题文字区` 先命中会把「横向主标题文字区」
+    # 变成「横向主留白区」（残留「主」字），所以带修饰语的写法先吃掉。
+    ("横向主标题文字区", "横向留白区"),
+    ("主标题文字区", "留白区"),
+    ("标题文字区", "留白区"),
+    ("文字说明区", "留白区"),
+    ("文字信息区", "留白区"),
+    ("文字与信息条区", "留白区"),
+    ("文字色块区", "留白区"),
+    ("文字承载区", "留白区"),
+    ("图文组合区", "图区"),
+    ("文字区", "留白区"),
+    ("文字说明", "留白"),
+    ("文字条", "留白"),
+    ("文字标签", "留白"),
+    # 「叠加文字」「每格底部叠加文字」——单独的「文字」也要吃掉，
+    # 否则模型会找地方写字（正向禁令压不住，见 2026-10-29 乱码实测）
+    ("叠加文字", "留白"),
+    ("文字", "留白"),
+    ("品牌标题区", "品牌留白区"),
+    ("大标题", "留白"),
+    ("主标题", "留白"),
+    ("标题位", "留白位置"),
+    ("标题", "留白"),
+    ("副文案", "留白"),
+    ("卖点短句", "留白"),
+    ("卖点条", "留白区"),
+    ("卖点位", "留白位置"),
+    ("卖点", "留白"),
+    # 「一句短文案」→「一句短留白」不通：整段吃掉，避免留下残句
+    ("一句短文案", "一处留白"),
+    ("短文案", "留白"),
+    ("文案", "留白"),
+    # 结构描述里本来就有「留白块/留白条」的（模板撰写时写的），同样要消掉矩形暗示
+    ("留白块", "留白"),
+    ("留白条", "留白"),
 ]
+
+# 替换的副作用收尾：逐条替换会拼出「预留留白与一处留白的位置」「预留留白位置」这类
+# 重复短语（规则互相叠），必须在主替换之后单独收一次，否则提示词读起来是病句。
+_NO_TEXT_STRUCTURE_CLEANUPS: List[Tuple[str, str]] = [
+    ("预留留白与一处留白的位置", "预留一处留白的位置"),
+    ("预留留白与留白的位置", "预留一处留白的位置"),
+    ("预留留白位置", "预留一处留白的位置"),
+    ("留白位置位置", "留白位置"),
+    ("留白留白", "留白"),
+    # 装饰词摘除后相邻两个留白会并成「留白区留白区」「留白区留白」——收敛成一个
+    ("留白区留白区", "留白区"),
+    ("留白区留白", "留白区"),
+    ("留白留白区", "留白区"),
+]
+
+# 摘掉装饰词后残留的标点/连接词。必须放在整条链路最后，因为前面的替换
+# 会不断制造新的「，、」「，，」「以形成」；放中间会被后续替换再破坏一次。
+_STRUCTURE_PUNCT_CLEANUPS: List[Tuple[str, str]] = [
+    ("、、", "、"),
+    ("，、", "，"),
+    ("、，", "，"),
+    ("，，", "，"),
+    ("；，", "；"),
+    ("，；", "；"),
+    ("。，", "。"),
+    ("，。", "。"),
+    ("；。", "。"),
+    ("，以形成", "，形成"),
+    ("以形成", "形成"),
+    ("，以上下", "，上下"),
+    ("，以弧形与上下区域", ""),
+    ("，以", "，"),
+    ("以弧形", ""),
+]
+
+# 版式描述里「分区怎么画」的部分必须整段摘掉——它描述的是视觉分隔手段，
+# 模型会照着画出来（2026-10-29 实测 db:19「以硬边分隔形成多格拼接布局」→
+# 底部 25% 被画成四列半透明矩形 + 硬边竖线，压在商品裙摆上）。
+# 无文字模式只需要「哪个区占多少、放什么」；分隔线/边框/卡片由设计师后期做。
+# 注意：只摘词、不整句删——整句删会把同一句里的占比一起丢掉（实测 #122 丢了商品图描述）。
+_LAYOUT_DECOR_TOKENS: Tuple[str, ...] = (
+    "硬边", "分隔", "分割", "分栏", "拼接", "白线", "边框", "圆角",
+    "卡片", "色块", "色条", "信息条", "斜切", "边界", "竖线", "细线",
+    "横线", "圆角框", "外框",
+)
+
+# 装饰性名词本身 = 一个可见块，收敛成留白（长词在前，避免摘一半留一半）
+_LAYOUT_DECOR_NOUNS: List[Tuple[str, str]] = [
+    ("半透明深色圆角信息条", "留白区"),
+    ("半透明圆角信息条", "留白区"),
+    ("半透明深色信息条", "留白区"),
+    ("浅色硬边圆角信息面板", "留白区"),
+    ("硬边圆角信息面板", "留白区"),
+    ("半透明圆角信息色块", "留白区"),
+    ("渐变色块条", "留白区"),
+    ("弧形色块条", "留白区"),
+    ("信息面板", "留白区"),
+    ("信息色块", "留白区"),
+    ("信息卡片", "留白区"),
+    ("信息框", "留白区"),
+    ("信息卡", "留白区"),
+    ("色块条", "留白区"),
+    ("色条", "留白区"),
+    ("信息条", "留白区"),
+    ("图片卡片", "商品图"),
+    ("卡片区", "图区"),
+    ("面板", "留白区"),
+    ("色块区", "留白区"),
+    ("色块", "留白区"),
+]
+
+# 无文字模式下「四列等宽留白区」= 四个空文字位，不出字就不需要分列，
+# 留着「四列」只会让模型画四条竖线。商品图区的列数不动（那里确实要多图并排）。
+_BLANK_COLS_RE = re.compile(
+    r"[一二三四五六七八九十两\d]+\s*(?:列|格|栏)\s*(?:等宽|并列|等分)?\s*(?:的)?\s*留白区"
+)
+
+# 摘完装饰词后剩下的空壳分句：「三块区域均为」「右侧约20%有」这类没有实体内容，
+# 留着只会让模型去猜「这里该画什么」。
+_DANGLING_TAIL_RE = re.compile(r"(?:为|有|以|均|按|的|并|且|与|及|用)$")
+
+
+def _drop_empty_clauses(text: str) -> str:
+    """删掉摘掉装饰词后变成空壳的分句（无实体内容、只剩连接词）。"""
+    parts = re.split(r"([，。；,;])", text)
+    out: List[str] = []
+    for i in range(0, len(parts), 2):
+        seg = parts[i]
+        sep = parts[i + 1] if i + 1 < len(parts) else ""
+        body = seg.strip()
+        if not body:
+            out.append(seg + sep)
+            continue
+        if _DANGLING_TAIL_RE.search(body) and "%" not in body:
+            continue
+        # 去掉空白/数字/百分比/「约」后不足 3 字 = 没有实体名词
+        if len(re.sub(r"[\s\d%约．.]", "", body)) < 3:
+            continue
+        out.append(seg + sep)
+    return "".join(out).strip("，。；,; ")
+
+
+def _sanitize_structure_no_text(structure: str) -> str:
+    """无文字模式：把版式描述清洗成「只有分区位置与占比」的纯结构说明。
+
+    四步，顺序不能换：
+    1. 文字位词 → 留白（「标题区」会直接诱发模型画字形，正向禁令压不住）
+    2. 装饰性名词 → 留白区（信息条/色块条/卡片 = 可见的块）
+    3. 装饰性形容词/动词摘除（硬边/分隔/圆角/拼接 = 怎么画线）
+    4. 删掉摘完后的空壳分句
+
+    「留白」的定义不在这里追加 —— 定义在 aplus_layout 模板的 {layout_text_rule}
+    里给一次（「与背景连续的整片留白…不留任何矩形色块」）。两处都写会重复，稀释指令。
+    """
+    text = structure or ""
+    for old, new in _NO_TEXT_STRUCTURE_REPLACEMENTS:
+        text = text.replace(old, new)
+    for old, new in _LAYOUT_DECOR_NOUNS:
+        text = text.replace(old, new)
+    for token in _LAYOUT_DECOR_TOKENS:
+        text = text.replace(token, "")
+    text = _BLANK_COLS_RE.sub("留白区", text)
+    text = _drop_empty_clauses(text)
+    for old, new in _NO_TEXT_STRUCTURE_CLEANUPS:
+        text = text.replace(old, new)
+    # 摘词后的标点/连接词收尾必须放最后：前面的替换会不断制造新的「，、」「，，」
+    for old, new in _STRUCTURE_PUNCT_CLEANUPS:
+        text = text.replace(old, new)
+    return text.strip("，、；; ")
 
 
 def _build_prompt(gen_type: str, product_info: str, extra_prompt: str,
                   brand_genes: str = "",
-                  variation: Optional[Dict[str, str]] = None) -> str:
-    """拼接原始提示词（轻量版）。
+                  multi_shot: bool = False,
+                  no_text: bool = False,
+                  layout_structure: str = "",
+                  layout_with_image: bool = False,
+                  fact_card: Optional[Dict[str, Any]] = None,
+                  brand_name: str = "") -> str:
+    """拼接原始提示词（brief 式）。
 
-    PE 的「图片」输入接了参考图，它能看到商品形态与组合关系，会自行生成镜头/光线/构图。
-    原始提示词只负责三件事：要什么类型的图、图片上看不出来的商品事实、必须保留的不变量。
-    写死焦段/光圈/色温/构图占比反而会与 PE 的判断冲突（实测导致「蛋糕装饰」被拆成桌面摆件）。
-    用 replace 而非 format，避免用户文本中的花括号报错。
+    PE 的「图片」输入接了参考图，它能看到商品形态与组合关系，会自行设计场景/机位/光线/姿态。
+    原始提示词只负责：要什么类型的图、图片上看不出来的商品事实、必须保留的不变量。
+    写死焦段/色温/构图占比会与 PE 的判断冲突（实测导致「蛋糕装饰」被拆成桌面摆件）。
+    2026-10-27 用户裁定：连「构图/姿态/光线」也不要指定，只保留“多张之间必须有差异”。
+
+    no_text=True 时（A+ 默认）：① 从品牌基因里剔除「画面文字语言 X」——2026-10-28 探针实测，
+    该字段与「预留排版空间」同时出现会把 PE 整段输出切成英文（1444 字并自造 dotted frame）；
+    ② 模板有 {text_clause} 则替换成无字条款，没有则维持原来的追加句。
+
+    layout_structure 非空（A+ 绑定了带描述的版式）时改用 aplus_layout 模板：
+    构图完全交给版式分区，原模板里「一侧留三分之一空域」「不得出现分栏」等自由构图条款
+    会与「三格分栏 / 上图下文条 / 信息条」类版式直接矛盾，必须整体替换而不是叠加。
+
+    2026-10-29 实测（水母横幅 × 3 版式）：把版式成稿图送进 PE，PE 会把版式里的
+    商品与文字当成要画的内容——商品被换成耳环/T 恤、无文字模式下照搬英文大标题。
+    因此**有结构文字的版式不再送图**（纯文字分区 + 商品图），layout_with_image 仅用于
+    控制正文里「第二张参考图」句子的有无。
     """
     templates = _load_prompt_templates()
-    tpl = templates.get(gen_type, {}).get("template")
+    layout_structure = (layout_structure or "").strip()
+    if gen_type == "aplus_banner":
+        # 品牌横幅不使用版式模板：独立模板 + 后置品牌名合约
+        tpl = templates.get("aplus_banner", {}).get("template")
+        if not tpl:
+            raise AIImageError("缺少 aplus_banner 提示词模板（prompts/image_prompt_templates.json）")
+    elif gen_type.startswith("aplus") and layout_structure:
+        if no_text:
+            layout_structure = _sanitize_structure_no_text(layout_structure)
+        tpl = templates.get("aplus_layout", {}).get("template")
+        if not tpl:
+            raise AIImageError("缺少 aplus_layout 提示词模板（prompts/image_prompt_templates.json）")
+        tpl = tpl.replace("{layout_structure}", layout_structure)
+        tpl = tpl.replace("{layout_ref_note}", (
+            "第二张参考图是版式成稿样例：只借用它的分区与留白，"
+            "其中出现的商品、文案、配色与 logo 一律不得带入画面。" if layout_with_image else ""
+        ))
+        # 版式里的「文字区/大标题」描述会诱发模型画字，无文字的禁令压不住
+        # （2026-10-29 实测：方形-32 出乱码标题、竖版-9 出整段英文卖点）——
+        # 必须给正向指令：文字区 = 与背景连续的整片留白，而不是「不要写字」。
+        # 「纯色色块填充」的旧措辞会被画成一块可见的浅色矩形（2026-10-29 用户裁定改掉）：
+        # 留白必须等于背景本身，不能是贴在背景上的一块东西。
+        tpl = tpl.replace("{layout_text_rule}", (
+            "全部做成与背景连续的整片留白：该区域的背景自然延伸过去，不留任何矩形色块、"
+            "边框、卡片、圆角或阴影分界，也不绘制任何字形、字母、数字、标语或图形化文字占位"
+            "（文字由设计师后期排版）。"
+            if no_text else
+            "排布品牌文案，语言与目标市场一致，字号层级分明。"
+        ))
+    else:
+        tpl = templates.get(gen_type, {}).get("template")
     if not tpl:
         raise AIImageError(f"生成类型 {gen_type} 缺少提示词模板")
 
+    genes = brand_genes or ""
+    if no_text and genes:
+        genes = "；".join(p for p in genes.split("；") if "画面文字语言" not in p)
+
     info = (product_info or "").strip() or "（未提供，请以参考图可见特征为准）"
-    extra = (extra_prompt or "").strip()
-    out = tpl.replace("{product_info}", info)
-    out = out.replace("{extra_prompt}", f"\n补充要求：{extra}" if extra else "")
-    if brand_genes:
-        out += f"\n品牌与区域：{brand_genes}"
-    if variation:
-        parts = [
-            f"构图 {variation['framing']}",
-            f"姿态 {variation['pose']}",
-            f"光线 {variation['light']}",
-        ]
-        if variation.get("setting"):
-            parts.append(f"环境 {variation['setting']}")
-        out += (
-            "\n本张要求（与其他张必须不同）：" + "；".join(parts) + "。"
-            "\n（其中「商品所在位置」按该商品实际的佩戴/使用部位理解，"
-            "例如头饰在头部、腰带或腰包在腰部、护腕手镯在手腕、摆件在台面；"
-            "场景环境由你按商品风格设计，不另行指定。）"
+    structured_intro = "商品信息（运营提供，优先采用；与参考图核对后写入事实卡）："
+    if fact_card:
+        from services.aplus_fact_card import render_fact_card
+        info = render_fact_card(fact_card)
+        structured_intro = (
+            "以下为运营确认的结构化商品事实卡（唯一事实来源，不得改写字段；"
+            "quantity=待确认 的项保持待确认，不得猜测）："
         )
+    extra = (extra_prompt or "").strip()
+    has_clause_slot = "{text_clause}" in tpl
+    out = tpl.replace("{fact_card_intro}", structured_intro)
+    out = out.replace("{product_info}", info)
+    out = out.replace("{extra_prompt}", f"\n补充要求：{extra}" if extra else "")
+    if has_clause_slot:
+        # 品牌横幅：品牌名由 572 后置合约注入，571 只负责「不要自造文字」，
+        # 不能复用通用无字条款（它会把品牌名也一并禁掉）。
+        clause = _BANNER_TEXT_CLAUSE if gen_type == "aplus_banner" else (
+            _NO_TEXT_CLAUSE if no_text else _TEXT_OK_CLAUSE
+        )
+        out = out.replace("{text_clause}", clause)
+    if genes:
+        out += f"\n品牌与区域：{genes}"
+    # 品牌横幅：真实品牌名必须同时进 571。2026-11-02 任务 #108 实测：只靠 572 后置合约时，
+    # PE 会在增强输出里按参考图调性自造品牌名（"FLEUR DE ROSE"），模型跟从 PE 丢弃合约。
+    # 让 PE 一开始就知道真名，它才会把该名字写进自己的输出。
+    if gen_type == "aplus_banner" and brand_name:
+        out += (
+            f"\n品牌名：{brand_name}（画面唯一要展示的品牌名，逐字使用、保持大小写，"
+            "不得设计、猜测或另起任何其他品牌名）"
+        )
+    if no_text and not has_clause_slot:
+        out += "\n无文字模式：画面中不要出现任何文字、标语、水印或标识。"
+    # 2026-10-28 取消「多张必须不同」的追加句：PE 是确定性函数（同输入两次 md5 相同），
+    # 该句进不了 PE 输出，只增加噪声；多张差异必须靠输入侧锚点（如 scene_person 的 PERSON_VARIATIONS）。
+    # multi_shot 形参保留以兼容调用点。
     return out
 
 
@@ -590,23 +1302,51 @@ def _build_workflow(
     image_names: List[str],
     filename_prefix: str,
     megapixels: float = DEFAULT_MEGAPIXELS,
+    workflow_path: Optional[str] = None,
+    layout_contract: Optional[str] = None,
+    encode_images: bool = True,
 ) -> Dict[str, Any]:
     """读取工作流模板并填入本次生成参数（switch=true 走 EmptyLatentImage 生图路径）
+
+    encode_images=False（品牌A+横幅）：参考图只进 PE（提取风格），
+    从 497 图像条件中全部摘除，保证画面里不会画出商品。
 
     多参考图：模板只接了 1 个 LoadImage(475) → 532 → 497.images.image_1 / 565.图片。
     这里按张数动态注入 LoadImage + ImageScaleToTotalPixels 节点，并挂到
     497 的 AUTOGROW 通道 images.image_N 与 PE 的 图片N（N=2..8）。
+
+    workflow_path：A+ 实验通道（direct/append）使用专用工作流文件；
+    direct 变体没有 PE 节点（565/569 已移除），注入时自动跳过 PE 相关接线。
+    layout_contract：append 变体的版式契约文本，写入 572 节点（PE 之后拼接，
+    PE 改写不到）。给了契约但工作流里没有 572 → 直接报错，不静默丢弃。
     """
     if not image_names:
         raise AIImageError("参考图为空")
     if len(image_names) > MAX_REF_IMAGES:
         raise AIImageError(f"最多 {MAX_REF_IMAGES} 张参考图")
 
+    path = workflow_path or settings.IMAGE_WORKFLOW_PATH
     try:
-        with open(settings.IMAGE_WORKFLOW_PATH, encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             wf = json.load(f)
     except Exception as e:
-        raise AIImageError(f"读取生图工作流模板失败: {e}")
+        raise AIImageError(f"读取生图工作流模板失败({os.path.basename(path)}): {e}")
+
+    # A+ 专用工作流的必需节点校验：缺节点立即报错，绝不静默降级回旧链路
+    if workflow_path:
+        missing = [
+            n for n in (NODE_PROMPT, NODE_REF_IMAGE, NODE_RESOLUTION,
+                        NODE_SEED, NODE_SAVE, NODE_ENCODE)
+            if n not in wf
+        ]
+        if missing:
+            raise AIImageError(
+                f"A+ 工作流 {os.path.basename(path)} 缺少必需节点: {missing}"
+            )
+        if layout_contract and NODE_CONTRACT not in wf:
+            raise AIImageError(
+                f"A+ 工作流 {os.path.basename(path)} 缺少版式契约节点 {NODE_CONTRACT}"
+            )
 
     wf[NODE_PROMPT]["inputs"]["value"] = prompt
     wf[NODE_REF_IMAGE]["inputs"]["image"] = image_names[0]
@@ -616,6 +1356,13 @@ def _build_workflow(
     wf[NODE_SEED]["inputs"]["seed"] = int(seed)
     wf[NODE_SAVE]["inputs"]["filename_prefix"] = filename_prefix
     # UNET/CLIP/VAE/KSampler/增强器等固定节点均以模板为准，代码不再覆盖
+
+    # 品牌A+横幅：497 不接任何参考图（含模板里的主图 image_1），
+    # 参考图只保留 PE 的「图片」通道用于风格提取。
+    if not encode_images:
+        enc_inputs = (wf.get(NODE_ENCODE) or {}).get("inputs") or {}
+        for key in [k for k in enc_inputs if str(k).startswith("images.")]:
+            enc_inputs.pop(key, None)
 
     # 额外参考图：每张一个 LoadImage + 尺度对齐节点（与主图 532 同像素，避免尺度不一致）
     for i, name in enumerate(image_names[1:], start=2):
@@ -635,8 +1382,18 @@ def _build_workflow(
             "class_type": "ImageScaleToTotalPixels",
             "_meta": {"title": f"参考图{i}尺度对齐"},
         }
-        wf[NODE_ENCODE]["inputs"][f"images.image_{i}"] = [scale_id, 0]
-        wf[NODE_PE]["inputs"][f"图片{i}"] = [scale_id, 0]
+        if encode_images:
+            wf[NODE_ENCODE]["inputs"][f"images.image_{i}"] = [scale_id, 0]
+        if NODE_PE in wf:  # direct 变体无 PE 节点
+            wf[NODE_PE]["inputs"][f"图片{i}"] = [scale_id, 0]
+
+    # 版式契约：append 变体专用（PE 之后拼接，PE 改写不到）。
+    # 常规调用只有 append 路径会带契约（上面已校验 572 必在）；其它组合不注入只告警。
+    if layout_contract:
+        if NODE_CONTRACT in wf:
+            wf[NODE_CONTRACT]["inputs"]["value"] = layout_contract
+        else:
+            logger.warning("当前工作流缺少版式契约节点 572，契约未注入")
 
     # PE 节点参数按配置注入（workflow 文件里的值可被 .env 覆盖，便于一键回退）
     pe_node = wf.get(NODE_PE)
@@ -845,6 +1602,11 @@ def _run_task(task_id: int, comfy_prompt_ids: List[str],
     index_map 用于「只重试部分子项」：{prompt_id: result_images 下标}。
     """
     from services import tos_service
+    from services import comfy_priority
+
+    # 轮询期间仍在占 ComfyUI 队列（图未全部跑完）：登记优先级，视频/超分入队前让路。
+    # 重试路径没有经过 _prepare_and_run 的登记，所以这里也要打一次（set，幂等）。
+    comfy_priority.begin_image_task(task_id)
 
     logger.info(f"[AI生图] 任务 {task_id} 开始轮询，{len(comfy_prompt_ids)} 个子项")
     interval = max(3, int(settings.IMAGE_POLL_INTERVAL))
@@ -854,7 +1616,7 @@ def _run_task(task_id: int, comfy_prompt_ids: List[str],
     with _slot_sem:
         try:
             pending = dict(index_map) if index_map else {
-                pid: i for i, pid in enumerate(comfy_prompt_ids)
+                pid: i for i, pid in enumerate(comfy_prompt_ids) if pid
             }
             started_written = False
             cancelled = False
@@ -1059,9 +1821,11 @@ def _run_task(task_id: int, comfy_prompt_ids: List[str],
             _update_task(task_id, status="失败", error_message=str(e)[:900],
                          finished_at=datetime.now())
         finally:
-            with _lock:
-                _running.discard(task_id)
-                _cancel_flags.discard(task_id)
+            # 释放执行槽并启动该用户队列里的下一单（排队任务不再被拒绝提交）
+            _release_task_slot(task_id)
+            _clear_cancel(task_id)
+            # 任务结束：注销生图优先级，让超分/视频恢复入队
+            comfy_priority.end_image_task(task_id)
 
 
 # ComfyUI 不会因为我们停止轮询而停止执行：队列被视频生成/超分占用时，
@@ -1177,14 +1941,10 @@ def _recover_timed_out(task_id: int, token: int, pending: Dict[str, int],
                 db.close()
 
 
-def _ensure_worker(task_id: int, comfy_prompt_ids: Optional[List[str]] = None, *,
-                   prep_kwargs: Optional[Dict[str, Any]] = None,
-                   index_map: Optional[Dict[str, int]] = None) -> None:
-    """确保某任务有后台线程在跑（避免重复启动）"""
-    with _lock:
-        if task_id in _running:
-            return
-        _running.add(task_id)
+def _start_task_thread(task_id: int, comfy_prompt_ids: Optional[List[str]] = None, *,
+                       prep_kwargs: Optional[Dict[str, Any]] = None,
+                       index_map: Optional[Dict[str, int]] = None) -> None:
+    """启动任务后台线程（调用方必须已通过 _claim_task_slot 抢占执行槽）"""
     if prep_kwargs is not None:
         threading.Thread(
             target=_prepare_and_run, args=(task_id,), kwargs=prep_kwargs,
@@ -1196,6 +1956,26 @@ def _ensure_worker(task_id: int, comfy_prompt_ids: Optional[List[str]] = None, *
             kwargs={"index_map": index_map},
             daemon=True, name=f"ai-image-task-{task_id}",
         ).start()
+
+
+def _ensure_worker(task_id: int, comfy_prompt_ids: Optional[List[str]] = None, *,
+                   prep_kwargs: Optional[Dict[str, Any]] = None,
+                   index_map: Optional[Dict[str, int]] = None) -> bool:
+    """确保某任务有后台线程在跑（避免重复启动）。
+
+    :return: 是否真正启动了线程。False 表示该任务已有执行在跑，
+             调用方不得再把子项改回「排队中」（否则新 pid 无人轮询）。
+    """
+    if not _claim_task_slot(task_id):
+        return False
+    try:
+        _start_task_thread(
+            task_id, comfy_prompt_ids, prep_kwargs=prep_kwargs, index_map=index_map,
+        )
+    except Exception:
+        _release_task_slot(task_id)
+        raise
+    return True
 
 
 def submit_image_task(
@@ -1218,11 +1998,16 @@ def submit_image_task(
     main_aspect_ratio: Optional[str] = None,
     brand_settings: Optional[Dict[str, Any]] = None,
     provider: str = "local",
+    layout_keys: Optional[List[str]] = None,
+    product_fact_card: Optional[Dict[str, Any]] = None,
+    brand_name: str = "",
 ) -> Dict[str, Any]:
     """提交套图生成任务：落库后立即返回，准备与轮询全部在后台线程
 
     :param generation_types: 生成类型 key 列表（GEN_TYPES 的子集）
     :param images: [(文件名, 图片字节)]，1~8 张参考图
+    :param product_fact_card: P4 结构化商品事实卡；提供时覆盖 product_info 作为唯一事实来源
+    :param brand_name: 品牌A+横幅必填的英文品牌名（保留大小写），其他类型忽略
     """
     _ensure_models_loaded()
     from database.database import SessionLocal
@@ -1232,6 +2017,18 @@ def submit_image_task(
         raise AIImageError("请至少上传一张参考图")
     if len(images) > MAX_REF_IMAGES:
         raise AIImageError(f"最多上传 {MAX_REF_IMAGES} 张参考图")
+
+    # P4 结构化商品事实卡：提供时校验并渲染，覆盖自然语言 product_info
+    fact_card: Optional[Dict[str, Any]] = None
+    if product_fact_card:
+        from services.aplus_fact_card import (
+            normalize_fact_card, render_fact_card, validate_fact_card,
+        )
+        errors = validate_fact_card(product_fact_card)
+        if errors:
+            raise AIImageError("商品事实卡校验失败：" + "；".join(errors[:5]))
+        fact_card = normalize_fact_card(product_fact_card)
+        product_info = render_fact_card(fact_card)
 
     # 品牌/区域设置兜底：这三项决定画面语境与文字语言，缺省就用默认值，
     # 保证「未填」也一定会进提示词（否则模型按自己的偏好出图，且详情页显示空白）
@@ -1249,6 +2046,19 @@ def submit_image_task(
         if not relay_image_service.is_configured():
             raise AIImageError("中转站模型未配置（缺少 IMAGE_RELAY_API_BASE / IMAGE_RELAY_API_KEY）")
     image_count = min(max(1, int(image_count)), 4)
+
+    # 品牌A+横幅：品牌名逐字进画面，必须由用户显式给出（用于填默认的品牌名一律拒绝）。
+    # 本地 / 中转站（Nano Banana 2）通道均支持，中转站走专属的品牌横幅设计指令。
+    if aplus_type == "aplus_banner":
+        brand_name = _normalize_brand_name(brand_name)
+        if not brand_name:
+            raise AIImageError("品牌A+横幅必须填写品牌名（英文，2–20 个字符，区分大小写）")
+        # 落库到 brand_settings（不新增数据库列），历史回填与重试都从这里读
+        brand_settings["brand_name"] = brand_name
+    else:
+        brand_name = ""
+        # 历史回填可能把上一单的 brand_name 一并带回来，非横幅任务不得残留
+        brand_settings.pop("brand_name", None)
 
     # ===== v2 分组解析（兼容 v1：未传新参数时由旧参数映射）=====
     if aplus_type is None and main_types is None:
@@ -1278,23 +2088,110 @@ def submit_image_task(
     if not aplus_type and not main_counts:
         raise AIImageError("请至少选择 A+ 类型或主副图类型")
 
+    # ===== A+ 版式：选 N 个版式 → 每种生成一张；未选 → 按画幅随机取官方版式 =====
+    # 与参考实现（ai.linkfox.com 商品套图）一致：没有「无版式自由发挥」这条兜底路径，
+    # 因为纯提示词的 A+ 出图只会是「宽幅场景照 + 一块死白」，结构上就不像 A+ 模块。
+    layouts: List[Dict[str, Any]] = []
+    aplus_sheets = image_count if aplus_type else 0
+    layout_checks: List[Dict[str, Any]] = []
+    if aplus_type == "aplus_banner":
+        # 品牌横幅不使用排版模板：不解析 layout_keys、不随机取官方版式，
+        # 张数完全由用户自选（1~4），每张只换 seed。
+        if layout_keys:
+            logger.info("[AI生图] 品牌A+横幅不使用版式，已忽略 layout_keys")
+        layouts = []
+        aplus_sheets = image_count
+    elif aplus_type:
+        from services import ai_image_layout_service as layout_svc
+        keys = list(layout_keys or [])
+        if keys:
+            try:
+                layouts = layout_svc.resolve_layouts(user_id, tenant_id, keys)
+            except layout_svc.LayoutError as e:
+                # 统一转成 AIImageError：路由层只把 AIImageError 映射成 400，
+                # 否则「版式不存在」会被当成 500 内部错误，前端只看到「提交任务失败」
+                raise AIImageError(str(e))
+            aplus_sheets = len(layouts)
+        else:
+            tag = "vertical" if aplus_type == "aplus_mobile" else "horizontal"
+            try:
+                all_presets = layout_svc.load_presets()
+            except layout_svc.LayoutError as e:
+                raise AIImageError(str(e))
+            pool = [p for p in all_presets if p["ratio_tag"] == tag] or all_presets
+            if not pool:
+                raise AIImageError("内置版式库为空（backend/prompts/aplus_layouts.json 缺失或格式错误）")
+            picks: List[Dict[str, Any]] = []
+            for i in range(image_count):
+                picks.append(pool[i % len(pool)] if i < len(pool) else random.choice(pool))
+            layouts, aplus_sheets = picks, image_count
+        # 上传版式要额外占 1 个参考图通道（商品图 + 版式图 ≤ 8）
+        if any(_layout_has_image(l) for l in layouts) and len(images) + 1 > MAX_REF_IMAGES:
+            raise AIImageError(
+                f"上传的版式图会额外占用 1 个参考图通道，商品图请控制在 {MAX_REF_IMAGES - 1} 张以内"
+            )
+        # P4.1：创建任务前校验模板可执行性与画幅兼容性，禁止静默退化/错配
+        layout_checks: List[Dict[str, Any]] = []
+        for lay in layouts:
+            check = layout_svc.check_aplus_compatibility(lay, aplus_type)
+            if not check.get("ok"):
+                raise AIImageError(check.get("error") or "版式不可用")
+            layout_checks.append(check)
+    else:
+        layout_checks = []
+
     # 单任务总张数护栏：防止一次提交就把 ComfyUI 串行队列灌满（与生视频互抢）
-    total_sheets = (image_count if aplus_type else 0) + sum(main_counts.values())
+    total_sheets = aplus_sheets + sum(main_counts.values())
     if total_sheets > MAX_SHEETS_PER_TASK:
         raise AIImageError(
             f"单个任务最多生成 {MAX_SHEETS_PER_TASK} 张（当前 {total_sheets} 张），请减少类型或张数"
         )
 
     no_text_mode = bool((brand_settings or {}).get("no_text_mode"))
+    # A+ 文字模式：默认无字（T0）。显式传 text_mode="with_text" 才允许 PE 排版文字。
+    # 无字时 _build_prompt 会同步剔除品牌语言字段——那是 PE 转英文输出的触发器。
+    aplus_text_mode = str((brand_settings or {}).get("text_mode") or "").strip().lower()
+    # 品牌横幅固定「无字底图 + 后置品牌名合约」：文字开关对它不生效，
+    # 否则 PE 会自行排版文案，与「画面只有品牌名」直接冲突。
+    aplus_no_text = True if aplus_type == "aplus_banner" else (aplus_text_mode != "with_text")
+
+    # P4.1：模板快照在创建任务时固化（含执行模式、版本、比例、契约），
+    # 生成与重试都只读快照，模板后续被修改不影响历史任务。
+    layout_snapshots: List[Dict[str, Any]] = []
+    layout_warnings: List[str] = []
+    for lay, check in zip(layouts, layout_checks):
+        mode = layout_svc.execution_mode(lay)
+        contract = ""
+        if mode in ("zones", "text"):
+            contract = _layout_contract(lay, aplus_type, aplus_no_text) or ""
+        snap = {
+            "layout_id": lay.get("id") or lay.get("key"),
+            "key": lay.get("key"),
+            "name": lay.get("name"),
+            "source": lay.get("source"),
+            "ratio_tag": lay.get("ratio_tag"),
+            "aspect_ratio": lay.get("aspect_ratio"),
+            "template_version": lay.get("template_version"),
+            "structure": lay.get("structure") or "",
+            "zones": lay.get("zones") or [],
+            "image_url": lay.get("image_url") or "",
+            "execution_mode": mode,
+            "warnings": list(check.get("warnings") or []),
+            "layout_contract": contract,
+        }
+        lay["_snapshot"] = snap
+        layout_snapshots.append(snap)
+        for w in snap["warnings"]:
+            layout_warnings.append(f"{snap['name'] or snap['key']}：{w}")
 
     # 生成计划：(类型键, 生成比例, 目标裁剪尺寸|None, 展示名, seq, no_text, megapixels)
     gen_plan: List[Tuple[str, str, Optional[Tuple[int, int]], str, int, bool, float]] = []
     if aplus_type:
         spec = APLUS_SPECS[aplus_type]
         aplus_mp = float(spec.get("megapixels") or DEFAULT_MEGAPIXELS)
-        for seq in range(image_count):
+        for seq in range(aplus_sheets):
             gen_plan.append((aplus_type, spec["gen_ratio"], spec["target_size"],
-                             spec["label"], seq, False, aplus_mp))
+                             spec["label"], seq, aplus_no_text, aplus_mp))
     for t, c in main_counts.items():
         for seq in range(c):
             gen_plan.append((t, main_aspect_ratio, None, MAIN_GEN_TYPES[t], seq,
@@ -1303,34 +2200,43 @@ def submit_image_task(
     # 展开子任务（target_size 供轮询完成后裁剪；no_text 供提示词追加无文字指令）
     items: List[Dict[str, Any]] = []
     for (t, _ratio, target_size, label, seq, _no_text, _mp) in gen_plan:
-        items.append({
+        item: Dict[str, Any] = {
             "type": t, "label": label, "seq": seq,
             "status": "排队中", "url": None, "error": None,
             "target_size": list(target_size) if target_size else None,
-            "no_text": no_text_mode and t in MAIN_GEN_TYPES,
-        })
+            "no_text": _no_text,
+        }
+        # A+ 子项绑定自己的版式（seq 即 layouts 下标）；快照在创建任务时即落库
+        if aplus_type and t == aplus_type and seq < len(layouts):
+            snap = dict(layouts[seq].get("_snapshot") or {})
+            if snap:
+                item["layout"] = snap
+        # 品牌横幅：品牌名随子项落库，重试/历史详情不依赖 brand_settings 是否被改动
+        if t == "aplus_banner":
+            item["brand_name"] = brand_name
+        items.append(item)
     display_types = [aplus_type] if aplus_type else []
     display_types += list(main_counts.keys())
 
+    prep_kwargs = {
+        "images": images,
+        "gen_plan": gen_plan,
+        "image_count": image_count,
+        "product_info": product_info,
+        "extra_prompt": prompt,
+        "brand_genes": _compile_brand_genes(brand_settings),
+        "provider": provider,
+        "product_name": product_name,
+        "layouts": layouts,
+        "fact_card": fact_card,
+        "brand_name": brand_name,
+    }
+
     db = SessionLocal()
     try:
-        # 用户级并发 1：ComfyUI 是串行队列，同一用户多单并发只会互相拖慢并挤占生视频。
-        # 查活跃 + 插入是 check-then-insert，并发下两边都查不到会各建一单，故加用户锁。
+        # 用户级排队：任务一律接受并落库；同一用户已有任务在跑时，新任务保持「排队中」，
+        # 由 _release_task_slot → _advance_user_queue 在上一单结束后自动启动。
         with _user_submit_lock(user_id):
-            active = (
-                db.query(AIImageTask.id)
-                .filter(
-                    AIImageTask.user_id == user_id,
-                    AIImageTask.status.in_(["排队中", "生成中"]),
-                    AIImageTask.deleted_at.is_(None),
-                )
-                .first()
-            )
-            if active:
-                raise AIImageError(
-                    f"你还有任务 #{active[0]} 正在生成，请等它完成后再提交（可在生成记录中查看进度）"
-                )
-
             task = AIImageTask(
                 tenant_id=tenant_id, user_id=user_id,
                 creator_name=_safe_text(creator_name, 100) or "",
@@ -1355,23 +2261,21 @@ def submit_image_task(
     finally:
         db.close()
 
-    _ensure_worker(
-        task_id,
-        prep_kwargs={
-            "images": images,
-            "gen_plan": gen_plan,
-            "image_count": image_count,
-            "product_info": product_info,
-            "extra_prompt": prompt,
-            "brand_genes": _compile_brand_genes(brand_settings),
-            "provider": provider,
-            "product_name": product_name,
-        },
-    )
+    # 登记归属：空闲则立即启动，否则入队等待（HTTP 请求仍立即返回，前端看到「排队中」）
+    if _register_task_run(task_id, user_id, prep_kwargs):
+        if not _ensure_worker(task_id, prep_kwargs=prep_kwargs):
+            # 理论不可达：任务刚插入 DB，不应已有执行线程
+            _release_task_slot(task_id)
+    else:
+        logger.info(f"[AI生图] 任务 {task_id} 已加入用户 {user_id} 队列，等待前序任务完成")
 
     db = SessionLocal()
     try:
-        return _serialize(db.query(AIImageTask).filter(AIImageTask.id == task_id).first())
+        task = db.query(AIImageTask).filter(AIImageTask.id == task_id).first()
+        out = _serialize(task)
+        if layout_warnings:
+            out["layout_warnings"] = layout_warnings
+        return out
     finally:
         db.close()
 
@@ -1441,20 +2345,66 @@ def _card_to_text(card: Dict[str, Any]) -> str:
 def _plan_design_jobs(
     gen_plan: List[Tuple[str, str, Optional[Tuple[int, int]], str, int, bool, float]],
 ) -> List[Tuple[int, str, str, int]]:
-    """设计任务编排：scene_person **每张一个任务**（构图/姿态/光位要不同），
+    """设计任务编排：scene_person / A+ **每张一个任务**（构图、光位、版式分区各不相同），
     其余类型同类型多张复用一份（省调用，seed 变化即可）。
 
+    A+ 必须逐张设计：一个任务里每张挂的是**不同版式**，复用一份设计会让所有版式出成同一张。
     返回 [(gen_plan 下标, 类型, 比例, seq)]
     """
     jobs: List[Tuple[int, str, str, int]] = []
     seen: set = set()
     for gi, (t, ratio, _ts, _label, seq, _nt, _mp) in enumerate(gen_plan):
-        if t == "scene_person":
+        if t == "scene_person" or t.startswith("aplus"):
             jobs.append((gi, t, ratio, seq))
         elif t not in seen:
             seen.add(t)
             jobs.append((gi, t, ratio, 0))
     return jobs
+
+
+def _build_relay_items(
+    gen_plan: List[Tuple[str, str, Optional[Tuple[int, int]], str, int, bool, float]],
+    prompts: List[str],
+    prompt_cn_map: Dict[int, str],
+    shot_designs: List[Dict[str, Any]],
+    layouts: Optional[List[Dict[str, Any]]],
+    relay,
+) -> List[Dict[str, Any]]:
+    """构建中转站子项（仅元数据与提示词，尚未有图）。
+
+    必须在调用生成接口**之前**落库：服务重启后恢复线程只靠这份数据补跑，
+    否则在途的 relay 任务只能整单判失败、远端已产生的费用白花。
+    """
+    items: List[Dict[str, Any]] = []
+    for gi, (t, _ratio, target_size, label, seq, no_text, _mp) in enumerate(gen_plan):
+        item: Dict[str, Any] = {
+            "type": t, "label": label, "seq": seq,
+            "status": "排队中", "url": None, "error": None,
+            "target_size": list(target_size) if target_size else None,
+            "no_text": no_text,
+            # 中转站实际提交的完整提示词（无 PE，这就是最终提示词）
+            "final_prompt": prompts[gi] if gi < len(prompts) else None,
+            # 中文对照（运营阅读用，不参与出图）
+            "prompt_cn": prompt_cn_map.get(gi) or None,
+            # 该张是否由 AI 按产品定制（否则为模板回退）
+            "prompt_designed": bool(shot_designs[gi]) if gi < len(shot_designs) else False,
+            # AI 清点出的商品件数清单（用于核对一致性）
+            "inventory": (shot_designs[gi] if gi < len(shot_designs) else {}).get("inventory") or None,
+            # 该张的差异化维度（仅带人物场景），便于排查"为什么这几张构图不同"
+            "variation": (
+                relay.PERSON_VARIATIONS[seq % len(relay.PERSON_VARIATIONS)]
+                if t == "scene_person" else None
+            ),
+        }
+        if layouts and t.startswith("aplus") and seq < len(layouts):
+            lay = layouts[seq]
+            item["layout"] = {
+                "key": lay.get("key"), "name": lay.get("name"),
+                "source": lay.get("source"), "ratio_tag": lay.get("ratio_tag"),
+                "image_url": lay.get("image_url") or "",
+            }
+        items.append(item)
+    return items
 
 
 def _prepare_and_run_relay(
@@ -1466,6 +2416,8 @@ def _prepare_and_run_relay(
     extra_prompt: str,
     brand_genes: str = "",
     product_name: str = "",
+    layouts: Optional[List[Dict[str, Any]]] = None,
+    brand_name: str = "",
 ) -> None:
     """中转站通道：按图类型设计提示词 → 并行生成 → 转存 TOS。
 
@@ -1479,6 +2431,8 @@ def _prepare_and_run_relay(
     from services import relay_image_service as relay
 
     t0 = time.time()
+    # 子项在生成前先构建并落库（重启恢复依赖它），异常时也用它把未完成项落终态
+    items: List[Dict[str, Any]] = []
     token = _new_run_token(task_id)
     try:
         with _lock:
@@ -1500,6 +2454,15 @@ def _prepare_and_run_relay(
 
         main_bytes = images[0][1]
         facts_text = (product_info or "").strip()
+
+        # A+ 版式图取回（只有上传的版式有图；内置版式走 structure 文本）
+        layout_bytes_map: Dict[str, bytes] = {}
+        for lay in (layouts or []):
+            if _layout_has_image(lay) and not (lay.get("structure") or "").strip():
+                try:
+                    layout_bytes_map[lay.get("key") or ""] = _fetch_url_bytes(lay["image_url"])
+                except Exception as e:
+                    logger.warning(f"[AI生图] 任务 {task_id} 版式图取回失败（该张只用文字版式）: {e}")
 
         # 2. 商品分析：与生视频页**同一套** SYSTEM_PROMPT / 全部参考图 / temperature=0.3 /
         #    结构化输出。分析必须单独成一步 —— 夹在"写英文提示词"里时注意力被抢走，
@@ -1548,6 +2511,16 @@ def _prepare_and_run_relay(
                     relay.PERSON_VARIATIONS[seq % len(relay.PERSON_VARIATIONS)]
                     if t in per_shot_types else None
                 )
+                lay = (layouts[seq] if (layouts and t.startswith("aplus") and seq < len(layouts))
+                       else None)
+                # 版式描述喂给设计模型前必须做同一套无字清洗：
+                # relay 也走 A+ 无字模式，把「标题/文案/文字区」原样给设计模型，
+                # 它会把「标题区」翻成 "headline text block"，出图阶段就画出字块。
+                # no_text 取该张自己的值（gen_plan[gi][5]），不能用 submit 里的局部变量。
+                shot_no_text = bool(gen_plan[gi][5]) if gi < len(gen_plan) else False
+                hint = ((lay.get("structure") or "") if lay else "")
+                if hint and t.startswith("aplus") and shot_no_text:
+                    hint = _sanitize_structure_no_text(hint)
                 try:
                     d = relay.design_shot_prompt(
                         main_bytes, gen_type=t, ratio=ratio,
@@ -1555,6 +2528,10 @@ def _prepare_and_run_relay(
                         product_info=facts_text, extra=extra_prompt,
                         brand_genes=brand_genes, prepared=prepared,
                         variation=variation,
+                        layout_bytes=(layout_bytes_map.get(lay.get("key") or "") if lay else None),
+                        layout_hint=hint,
+                        # 品牌横幅：设计指令与商品图完全不同，需要逐字品牌名
+                        brand_name=(brand_name if t == "aplus_banner" else ""),
                     )
                     return job, d
                 except Exception as e:
@@ -1579,6 +2556,7 @@ def _prepare_and_run_relay(
 
         # 4. 逐项确定最终提示词（设计结果优先，缺失回退模板）
         #    按下标取设计结果：scene_person 每张一份，其他类型共用一份
+        multi_types = _multi_shot_types(gen_plan)
         prompt_cn_map: Dict[int, str] = {}
         shot_designs: List[Dict[str, Any]] = []
         prompts: List[str] = []
@@ -1595,53 +2573,61 @@ def _prepare_and_run_relay(
             else:
                 p = _build_prompt(
                     t, facts_text, extra_prompt, brand_genes,
-                    variation=(
-                        PERSON_VARIATIONS_CN[seq % len(PERSON_VARIATIONS_CN)]
-                        if t == "scene_person" else None
-                    ),
+                    multi_shot=(t in multi_types), no_text=no_text,
+                    # 品牌横幅回退模板时品牌名同样要进提示词
+                    brand_name=(brand_name if t == "aplus_banner" else ""),
                 )
-            p += f"\n\n画面比例 {ratio}。只输出生成后的图片，不要输出任何文字说明。"
-            # 除卖点图外一律禁止画面文字：模型容易自作主张加英文标签牌
-            if t != "selling_point":
-                p += "\n画面中不得出现任何文字、标签、价签、水印或标识。"
-            if no_text:
-                p += "\n画面中不要出现任何文字、标语、水印或标识。"
+                # 设计失败回退模板时，版式只能靠文字条款补（设计成功时已由设计模型写进 prompt_en）
+                if layouts and t.startswith("aplus") and seq < len(layouts):
+                    _lay = layouts[seq]
+                    if _lay.get("structure"):
+                        p = _build_prompt(
+                            t, facts_text, extra_prompt, brand_genes,
+                            multi_shot=(t in multi_types), no_text=no_text,
+                            layout_structure=_lay["structure"],
+                            layout_with_image=_layout_has_image(_lay),
+                        )
+                    else:
+                        from services import ai_image_layout_service as layout_svc
+                        p += layout_svc.layout_clause(_lay, no_text=no_text)
+            if t == "aplus_banner":
+                # 品牌横幅：唯一文字就是品牌名，禁止把「画面不得出现文字」追加进去自相矛盾；
+                # 比例按 970×300 声明（21:9 只是本地链路的生成比例，与横幅无关）。
+                p += "\n\n画面比例 970×300 横幅（约 3.2:1）。只输出生成后的图片，不要输出任何文字说明。"
+                p += f"\n品牌名 {brand_name} 是画面中唯一允许出现的文字，逐字精确、大小写不变；除它之外不得出现任何其他文字、字母或数字。"
+            else:
+                p += f"\n\n画面比例 {ratio}。只输出生成后的图片，不要输出任何文字说明。"
+                # 除卖点图外一律禁止画面文字：模型容易自作主张加英文标签牌
+                if t != "selling_point":
+                    p += "\n画面中不得出现任何文字、标签、价签、水印或标识。"
+                if no_text:
+                    p += "\n画面中不要出现任何文字、标语、水印或标识。"
             prompts.append(p)
 
-        _update_task(task_id, status="生成中", started_at=datetime.now())
         logger.info(f"[AI生图] 任务 {task_id} 走中转站生成，共 {len(prompts)} 张")
 
-        # 4. 并行生成（失败项独立，不影响其它张）
+        # 4. 先落「排队中 + 最终提示词」再生成：
+        #    重启恢复线程按这份数据补跑，避免在途任务整单判失败、远端已出图却丢失。
+        items = _build_relay_items(
+            gen_plan, prompts, prompt_cn_map, shot_designs, layouts, relay,
+        )
+        _update_task(
+            task_id, status="生成中", started_at=datetime.now(),
+            result_images=_dump_items(items),
+        )
+        logger.info(f"[AI生图] 任务 {task_id} 走中转站生成，共 {len(prompts)} 张")
+
+        # 5. 并行生成（失败项独立，不影响其它张）
         results = relay.generate_batch(main_bytes, prompts)
 
-        # 5. 落库 + 转存 TOS
-        items: List[Dict[str, Any]] = []
+        # 6. 填充结果 + 转存 TOS
         ok = 0
-        for gi, ((t, ratio, target_size, label, seq, no_text, mp), r) in enumerate(
+        for gi, ((t, _ratio, target_size, _label, seq, _no_text, _mp), r) in enumerate(
             zip(gen_plan, results)
         ):
-            item: Dict[str, Any] = {
-                "type": t, "label": label, "seq": seq,
-                "status": "排队中", "url": None, "error": None,
-                "target_size": list(target_size) if target_size else None,
-                "no_text": no_text,
-                # 中转站实际提交的完整提示词（无 PE，这就是最终提示词）
-                "final_prompt": prompts[gi] if gi < len(prompts) else None,
-                # 中文对照（运营阅读用，不参与出图）
-                "prompt_cn": prompt_cn_map.get(gi) or None,
-                # 该张是否由 AI 按产品定制（否则为模板回退）
-                "prompt_designed": bool(shot_designs[gi]) if gi < len(shot_designs) else False,
-                # AI 清点出的商品件数清单（用于核对一致性）
-                "inventory": (shot_designs[gi] if gi < len(shot_designs) else {}).get("inventory") or None,
-                # 该张的差异化维度（仅带人物场景），便于排查"为什么这几张构图不同"
-                "variation": (
-                    relay.PERSON_VARIATIONS[seq % len(relay.PERSON_VARIATIONS)]
-                    if t == "scene_person" else None
-                ),
-            }
+            item = items[gi]
             if not r.get("ok"):
                 item.update(status="失败", error=r.get("error") or "生成失败")
-                items.append(item)
                 continue
             try:
                 content = r["data"]
@@ -1655,7 +2641,6 @@ def _prepare_and_run_relay(
                 ok += 1
             except Exception as e:
                 item.update(status="失败", error=str(e)[:300])
-            items.append(item)
 
         # 过期执行：取消后用户已重试（新代号已接管），本次结果必须丢弃，
         # 否则会把重试的成果覆盖回旧结果
@@ -1683,12 +2668,178 @@ def _prepare_and_run_relay(
         )
     except Exception as e:
         logger.exception(f"[AI生图] 中转站任务 {task_id} 异常")
-        _update_task(task_id, status="失败", error_message=str(e)[:900],
-                     finished_at=datetime.now())
+        msg = str(e)[:900]
+        # 已落库的子项必须一起落终态，否则重启恢复无从判断哪些是真的没跑
+        for i, it in enumerate(items):
+            if it.get("status") not in ("已完成", "失败", "已取消"):
+                items[i] = dict(it, status="失败", error=f"生成中断：{msg}"[:300])
+        _update_task(
+            task_id, status="失败", error_message=msg,
+            result_images=_dump_items(items) if items else None,
+            finished_at=datetime.now(),
+        )
     finally:
-        with _lock:
-            _running.discard(task_id)
-            _cancel_flags.discard(task_id)
+        _release_task_slot(task_id)
+        _clear_cancel(task_id)
+
+
+def _ensure_relay_resume_worker(task_id: int) -> bool:
+    """重启后补跑中转站任务的后台线程（执行槽原子抢占，避免与用户重试并发）"""
+    if not _claim_task_slot(task_id):
+        return False
+    try:
+        threading.Thread(
+            target=_resume_relay_task, args=(task_id,),
+            daemon=True, name=f"ai-image-resume-relay-{task_id}",
+        ).start()
+    except Exception:
+        _release_task_slot(task_id)
+        raise
+    return True
+
+
+def _resume_relay_task(task_id: int) -> None:
+    """服务重启后补跑中转站任务：复用已落库的提示词，只生成未完成子项。
+
+    中转站是同步 HTTP 调用，重启时无法续接原请求；但子项在生成前已落库
+    （提示词、比例、目标尺寸），因此补跑不会重复支付设计费用，也不会整单丢失。
+    """
+    from services import tos_service
+    from services import relay_image_service as relay
+    from database.database import SessionLocal
+    from models.ai_image_task import AIImageTask
+
+    db = SessionLocal()
+    try:
+        row = (
+            db.query(AIImageTask)
+            .filter(
+                AIImageTask.id == task_id,
+                AIImageTask.deleted_at.is_(None),
+            )
+            .first()
+        )
+        if not row:
+            _release_task_slot(task_id)
+            return
+        items = _read_json_list(row.result_images)
+        image_urls = _read_json_list(row.images)
+    finally:
+        db.close()
+
+    pending = [
+        (i, it) for i, it in enumerate(items)
+        if it.get("status") in ("排队中", "生成中")
+    ]
+    if not pending:
+        if not items:
+            # 连子项都没落库：设计/上传阶段就中断，无从补跑，明确判失败而不是悬在「生成中」
+            _update_task(
+                task_id, status="失败",
+                error_message="服务重启，任务尚未进入生成阶段，请重新提交",
+                finished_at=datetime.now(),
+            )
+        else:
+            _update_task(
+                task_id, result_images=_dump_items(items),
+                status=_aggregate_status(items), finished_at=datetime.now(),
+            )
+        _release_task_slot(task_id)
+        return
+
+    token = _new_run_token(task_id)
+    try:
+        # 设计阶段就中断的任务没有提示词，重跑设计成本高且结果不可控 → 明确判失败
+        lacking = [i for i, it in pending if not (it.get("final_prompt") or "").strip()]
+        if lacking:
+            for i in lacking:
+                items[i] = dict(
+                    items[i], status="失败",
+                    error="服务重启，提示词尚未生成，请重新提交任务",
+                )
+            agg = _aggregate_status(items)
+            _update_task(
+                task_id, result_images=_dump_items(items),
+                status=agg,
+                finished_at=datetime.now() if agg not in ("生成中", "排队中") else None,
+            )
+            logger.warning(
+                f"[AI生图] 任务 {task_id} 重启恢复：{len(lacking)} 个子项缺少提示词，已判失败"
+            )
+            return
+
+        if not image_urls:
+            for i, _it in pending:
+                items[i] = dict(items[i], status="失败", error="参考图已丢失，请重新提交任务")
+            agg = _aggregate_status(items)
+            _update_task(
+                task_id, result_images=_dump_items(items),
+                status=agg,
+                finished_at=datetime.now() if agg not in ("生成中", "排队中") else None,
+            )
+            return
+
+        _http = requests.Session()
+        _http.trust_env = False
+        resp = _http.get(image_urls[0], timeout=60)
+        resp.raise_for_status()
+        main_bytes = resp.content
+
+        prompts = [it["final_prompt"] for _i, it in pending]
+        logger.info(f"[AI生图] 任务 {task_id} 重启恢复中转站，补跑 {len(prompts)} 张")
+        results = relay.generate_batch(main_bytes, prompts)
+
+        ok = 0
+        for (i, it), r in zip(pending, results):
+            if not r.get("ok"):
+                items[i] = dict(
+                    it, status="失败", url=None,
+                    error=(r.get("error") or "生成失败")[:300],
+                )
+                continue
+            try:
+                content = r["data"]
+                ts = it.get("target_size")
+                if isinstance(ts, list) and len(ts) == 2:
+                    content = _fit_to_target(content, tuple(ts))
+                content, fname = _to_jpeg(
+                    content, f"relay-{task_id}-{it.get('type')}-{it.get('seq')}-resume.png"
+                )
+                url = tos_service.upload_file(
+                    content, fname, content_type="image/jpeg", subdir="ai-image",
+                )
+                items[i] = dict(it, status="已完成", url=url, error=None)
+                ok += 1
+            except Exception as e:
+                items[i] = dict(it, status="失败", error=str(e)[:300])
+
+        # 取消同样适用于恢复线程：结果落库前把未完成项落「已取消」，避免取消后又变已完成
+        if _is_cancelled(task_id):
+            for i, it in pending:
+                if items[i].get("status") not in ("已完成", "失败"):
+                    items[i] = dict(items[i], status="已取消", error="任务已取消")
+
+        if not _is_current_token(task_id, token):
+            return
+        agg = _finalize_status(task_id, _aggregate_status(items))
+        _update_task(
+            task_id, result_images=_dump_items(items),
+            status=agg,
+            finished_at=datetime.now() if agg not in ("生成中", "排队中") else None,
+        )
+        logger.info(f"[AI生图] 任务 {task_id} 重启恢复完成 {ok}/{len(pending)} 张")
+    except Exception as e:
+        logger.exception(f"[AI生图] 任务 {task_id} 重启恢复中转站失败")
+        for i, _it in pending:
+            if items[i].get("status") not in ("已完成", "失败", "已取消"):
+                items[i] = dict(items[i], status="失败", error=f"恢复失败：{e}"[:300])
+        _update_task(
+            task_id, result_images=_dump_items(items),
+            status=_aggregate_status(items), finished_at=datetime.now(),
+        )
+    finally:
+        _release_task_slot(task_id)
+        _clear_cancel(task_id)
 
 
 def _prepare_and_run(
@@ -1702,6 +2853,9 @@ def _prepare_and_run(
     brand_genes: str = "",
     provider: str = "local",
     product_name: str = "",
+    layouts: Optional[List[Dict[str, Any]]] = None,
+    fact_card: Optional[Dict[str, Any]] = None,
+    brand_name: str = "",
 ) -> None:
     """后台线程：参考图传 TOS → 传 ComfyUI → 逐项提交工作流（不同 seed）→ 轮询到完成"""
     from services import tos_service
@@ -1715,8 +2869,16 @@ def _prepare_and_run(
             task_id, images=images, gen_plan=gen_plan,
             product_info=product_info, extra_prompt=extra_prompt,
             brand_genes=brand_genes, product_name=product_name,
+            layouts=layouts,
+            brand_name=brand_name,
         )
         return
+
+    # 本地通道要占 ComfyUI 串行队列：登记为「生图优先」，超分/视频入队前会让路
+    # （relay 通道在上面已 return，不占 ComfyUI，无需登记）
+    from services import comfy_priority
+
+    comfy_priority.begin_image_task(task_id)
 
     items: List[Dict[str, Any]] = []
     prompt_ids: List[str] = []
@@ -1729,8 +2891,8 @@ def _prepare_and_run(
             _update_task(task_id, status="失败",
                          error_message="H3_BASE_URL 未配置（.env 需配置 ComfyUI 服务地址/账号密码）",
                          finished_at=datetime.now())
-            with _lock:
-                _running.discard(task_id)
+            # 释放槽位：队列里的下一单继续处理（配置缺失会让它同样快速失败）
+            _release_task_slot(task_id)
             return
 
         # 1+2. 参考图并行上传：TOS（供前端展示）与 ComfyUI（生成用）同时进行
@@ -1761,30 +2923,117 @@ def _prepare_and_run(
             _update_task(task_id, images=json.dumps(urls, ensure_ascii=False))
         t_upload_done = time.time()
 
+        # 2.5 A+ 版式图入 ComfyUI（只有「用户上传的版式」有图；内置版式靠 structure 文本）
+        #     一个任务里多个上传版式各占 1 个通道，但每张图只带自己那一个，所以总数仍受 8 限制。
+        layout_names: Dict[str, str] = {}
+        # 只有「无结构文字」的版式才把图送进 PE：有 structure 的版式送图实测会导致
+        # PE 把版式成稿里的商品/文字当成画面内容（商品被替换 + 无文字模式失效）
+        _layout_imgs = [l for l in (layouts or [])
+                        if _layout_has_image(l) and not (l.get("structure") or "").strip()]
+        if _layout_imgs:
+            _base = len(images)
+
+            def _push_layout(arg: Tuple[int, Dict[str, Any]]) -> Tuple[str, Optional[str]]:
+                i, lay = arg
+                try:
+                    data = _fetch_url_bytes(lay["image_url"])
+                    name = _upload_image(_base + 100 + i, data)
+                    return lay.get("key") or "", name
+                except Exception as e:
+                    logger.warning(f"[AI生图] 任务 {task_id} 版式图上传失败（该张将只用文字版式）: {e}")
+                    return lay.get("key") or "", None
+
+            with ThreadPoolExecutor(max_workers=min(4, len(_layout_imgs))) as ex:
+                for key, name in ex.map(_push_layout, list(enumerate(_layout_imgs))):
+                    if key and name:
+                        layout_names[key] = name
+
         # 3. 按「类型 × 张数」逐项提交工作流，不同 seed；先全部提交后统一轮询
+        multi_types = _multi_shot_types(gen_plan)
+        # A+ 提示词通道实验：仅 A+ 子任务走专用工作流，主副图保持原链路
+        aplus_mode = (getattr(settings, "IMAGE_APLUS_PROMPT_MODE", "") or "").strip().lower()
+        aplus_wf_path = _resolve_aplus_workflow()
         for (t, gen_ratio, target_size, label, seq, no_text, mp) in gen_plan:
-            # 带人物场景按 seq 轮换构图/姿态/光位，避免多张撞图（PE 的 seed 固定为 666）
-            shot_variation = (
-                PERSON_VARIATIONS_CN[seq % len(PERSON_VARIATIONS_CN)]
-                if t == "scene_person" else None
-            )
-            prompt_text = _build_prompt(t, product_info, extra_prompt, brand_genes,
-                                        variation=shot_variation)
-            if no_text:
-                prompt_text += "\n无文字模式：画面中不要出现任何文字、标语、水印或标识。"
+            is_banner = t == "aplus_banner"
+            if is_banner:
+                # 品牌横幅：571 只设计「只有品牌名的底图」，品牌名同时进 571（让 PE 使用真名）
+                # 和 572 后置合约（逐字渲染）；参考图只进 PE 提取风格，497 不接图像条件。
+                prompt_text = _build_prompt(
+                    t, product_info, extra_prompt, brand_genes,
+                    multi_shot=(t in multi_types), no_text=True, fact_card=fact_card,
+                    brand_name=brand_name,
+                )
+            else:
+                prompt_text = _build_prompt(t, product_info, extra_prompt, brand_genes,
+                                            multi_shot=(t in multi_types), no_text=no_text,
+                                            fact_card=fact_card)
+            item_images = list(image_names)
+            lay = (None if is_banner else (
+                layouts[seq] if (layouts and t.startswith("aplus") and seq < len(layouts))
+                else None
+            ))
+            if lay:
+                from services import ai_image_layout_service as layout_svc
+                ref_name = layout_names.get(lay.get("key") or "")
+                if lay.get("structure"):
+                    # 版式版正文：构图完全交给版式分区。原 aplus 模板的
+                    # 「一侧留三分之一空域 / 不得出现分栏」与多分区版式直接矛盾，不能叠加。
+                    prompt_text = _build_prompt(
+                        t, product_info, extra_prompt, brand_genes,
+                        multi_shot=(t in multi_types), no_text=no_text,
+                        layout_structure=lay["structure"],
+                        layout_with_image=bool(ref_name),
+                        fact_card=fact_card,
+                    )
+                else:
+                    prompt_text += layout_svc.layout_clause(
+                        lay, no_text=no_text,
+                        ref_index=(len(item_images) + 1) if ref_name else None,
+                    )
+                if ref_name:
+                    item_images.append(ref_name)
+            wf_path = None
+            contract = None
+            encode_images = True
+            if is_banner:
+                # 专用工作流：固定 1888×576 latent（约 3.28:1），后处理裁到 970×300；
+                # 参考图只进 PE，497 不接图。品牌名已进 571，不再使用 572 后置合约
+                # （2026-11-02 A/B 实测后去除）。
+                wf_path = settings.IMAGE_BRAND_BANNER_WORKFLOW_PATH
+                encode_images = False
+            elif t.startswith("aplus") and aplus_wf_path:
+                if aplus_mode == "append":
+                    # P4.1：只读创建任务时的模板契约快照；模板后续被修改不影响本任务
+                    contract = (lay.get("_snapshot") or {}).get("layout_contract") or None
+                    if contract is None:
+                        contract = _layout_contract(lay, t, no_text)
+                    if contract is None:
+                        # 版式连结构文字都没有：契约无从生成，回退旧链路而不是空转
+                        logger.warning(
+                            f"[AI生图] 任务 {task_id} A+ 子项 {t}#{seq} 无版式结构，"
+                            f"append 契约不可用，回退默认工作流"
+                        )
+                    else:
+                        wf_path = aplus_wf_path
+                else:
+                    wf_path = aplus_wf_path
             seed = random.randint(1, 2**31 - 1)
             workflow = _build_workflow(
                 prompt=prompt_text,
                 aspect_ratio=gen_ratio,
                 seed=seed,
-                image_names=image_names,
+                image_names=item_images,
                 filename_prefix=f"AIIMG-{task_id}-{t}-{seq}",
                 megapixels=mp,
+                workflow_path=wf_path,
+                layout_contract=contract,
+                encode_images=encode_images,
             )
+            _wait_comfy_queue_slot(task_id)
             resp = _api("POST", "/prompt", json={"prompt": workflow})
             pid = resp.json()["prompt_id"]
             prompt_ids.append(pid)
-            items.append({
+            item = {
                 "type": t, "label": label, "seq": seq,
                 "status": "排队中", "url": None, "error": None,
                 "target_size": list(target_size) if target_size else None,
@@ -1792,8 +3041,26 @@ def _prepare_and_run(
                 "prompt_id": pid,
                 # 实际提交给 ComfyUI 571 节点的完整提示词（详情弹窗直接读库，不再依赖 /history）
                 "final_prompt": prompt_text,
-                "variation": shot_variation,
-            })
+                # 本地链路暂无差异轴（只有中转站的 scene_person 走 PERSON_VARIATIONS）；
+                # 这里曾引用未定义的 shot_variation，导致重启后本地生图 100% NameError。
+                "variation": None,
+            }
+            if is_banner:
+                item["brand_name"] = brand_name
+            if lay:
+                # P4.1：沿用创建任务时的完整快照（含 zones/contract/mode/version），
+                # 不能在生成阶段用当前模板重新拼一份，否则模板更新会污染在途任务。
+                snap = dict(lay.get("_snapshot") or {})
+                if not snap:
+                    snap = {
+                        "key": lay.get("key"), "name": lay.get("name"),
+                        "source": lay.get("source"), "ratio_tag": lay.get("ratio_tag"),
+                        "image_url": lay.get("image_url") or "",
+                        "structure": lay.get("structure") or "",
+                        "zones": lay.get("zones") or [],
+                    }
+                item["layout"] = snap
+            items.append(item)
 
         t_submit_done = time.time()
         _update_task(
@@ -1812,8 +3079,6 @@ def _prepare_and_run(
     except Exception as e:
         logger.error(f"[AI生图] 任务 {task_id} 准备阶段异常: {e}")
         msg = str(e)[:900]
-        with _lock:
-            _running.discard(task_id)
 
         # 已成功提交的子任务若丢弃，ComfyUI 会继续空跑且无人回收 → 回写后照常轮询
         if prompt_ids:
@@ -1855,6 +3120,16 @@ def _prepare_and_run(
                     f"[AI生图] 任务 {task_id} 未提交任何子任务，"
                     f"{len(pending_items)} 个子项一并标记失败"
                 )
+            # 没有任何子任务可回收：直接释放槽位并启动下一单
+            _release_task_slot(task_id)
+    finally:
+        # 无论提交成功/中断，都要注销优先级登记，否则超分/视频会一直让路
+        try:
+            from services import comfy_priority
+
+            comfy_priority.end_image_task(task_id)
+        except Exception:
+            pass
 
 
 def _serialize(task) -> Dict[str, Any]:
@@ -1899,6 +3174,8 @@ def _serialize(task) -> Dict[str, Any]:
         "cost_seconds": cost_seconds,
         "error_message": task.error_message,
         "created_at": task.created_at.strftime("%Y-%m-%d %H:%M") if task.created_at else "",
+        # 进行中任务的排队排位（已完成/失败为 None）：排队中到底在等什么、前面还有多少
+        "queue": _queue_info(task),
     }
 
 
@@ -2035,6 +3312,7 @@ def prompt_belongs_to_tenant(tenant_id: int, prompt_id: str) -> bool:
         return False
 
     _ensure_models_loaded()
+    from sqlalchemy import or_
     from database.database import SessionLocal
     from models.ai_image_task import AIImageTask
 
@@ -2044,7 +3322,12 @@ def prompt_belongs_to_tenant(tenant_id: int, prompt_id: str) -> bool:
             db.query(AIImageTask.id)
             .filter(
                 AIImageTask.tenant_id == tenant_id,
-                AIImageTask.comfy_prompt_ids.like(f"%{pid}%"),
+                # 重试生成的 pid 只落在子项里（任务级列表按下标同步失败/旧数据），
+                # 两处都要查，否则重试子项的历史提示词一律 404。
+                or_(
+                    AIImageTask.comfy_prompt_ids.like(f"%{pid}%"),
+                    AIImageTask.result_images.like(f"%{pid}%"),
+                ),
             )
             .first()
         )
@@ -2053,20 +3336,63 @@ def prompt_belongs_to_tenant(tenant_id: int, prompt_id: str) -> bool:
         db.close()
 
 
+def _delete_task_tos_objects(task_id: int, urls: List[str]) -> None:
+    """后台清理任务图片（TOS 删除是网络调用，不能阻塞删除接口）"""
+    if not urls:
+        return
+    from services import tos_service
+
+    removed = 0
+    failed = 0
+    for url in dict.fromkeys(urls):
+        try:
+            if tos_service.delete_file(url):
+                removed += 1
+            else:
+                failed += 1
+        except Exception as e:
+            failed += 1
+            logger.warning(f"[AI生图] 任务 {task_id} TOS 清理失败: {url} ({e})")
+    logger.info(f"[AI生图] 任务 {task_id} TOS 清理完成：删除 {removed} 个，跳过/失败 {failed} 个")
+
+
 def delete_image_task(tenant_id: int, task_id: int) -> None:
-    """删除任务记录（软删除，不影响已生成的图片）"""
+    """删除任务：软删数据库记录 + 清理该任务在 TOS 的参考图与生成图"""
     _ensure_models_loaded()
     from database.database import SessionLocal
     from models.ai_image_task import AIImageTask
 
+    urls: List[str] = []
     db = SessionLocal()
     try:
+        row = (
+            db.query(AIImageTask)
+            .filter(
+                AIImageTask.id == task_id,
+                AIImageTask.tenant_id == tenant_id,
+            )
+            .first()
+        )
+        if row:
+            # 生成中的任务仍在往 TOS 上传，先删会留下无人回收的孤儿对象
+            if row.status in ("排队中", "生成中"):
+                raise AIImageError("任务仍在生成中，请先取消后再删除")
+            # 生成图 + 参考图都归本任务所有（上传时使用 UUID 命名，不会与其他任务共享）
+            items = _read_json_list(row.result_images)
+            urls = [it.get("url") for it in items if isinstance(it, dict) and it.get("url")]
+            urls.extend(_read_json_list(row.images))
         db.query(AIImageTask).filter(
             AIImageTask.id == task_id, AIImageTask.tenant_id == tenant_id
         ).update({"deleted_at": datetime.now()})
         db.commit()
     finally:
         db.close()
+
+    if urls:
+        threading.Thread(
+            target=_delete_task_tos_objects, args=(task_id, urls),
+            daemon=True, name=f"ai-image-tos-cleanup-{task_id}",
+        ).start()
 
 
 def cancel_image_task(tenant_id: int, task_id: int) -> Dict[str, Any]:
@@ -2128,6 +3454,17 @@ def cancel_image_task(tenant_id: int, task_id: int) -> Dict[str, Any]:
         db.close()
 
 
+def _item_layout(it: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """从子项里取回当初用的版式（重试/回收时复现同一版式，不能丢）"""
+    lay = it.get("layout")
+    return lay if isinstance(lay, dict) and lay.get("key") else None
+
+
+def _layout_has_image(lay: Optional[Dict[str, Any]]) -> bool:
+    """该版式是否带参考图：上传素材与官方模板都有，内置结构版式只有文字分区"""
+    return bool(lay) and lay.get("source") in ("upload", "official") and bool(lay.get("image_url"))
+
+
 def _retry_relay_items(
     task_id: int,
     snapshot: List[Tuple[int, Dict[str, Any]]],
@@ -2158,7 +3495,8 @@ def _retry_relay_items(
         if not ratio:
             continue
         seq = int(it.get("seq") or 0)
-        if t == "scene_person":
+        # A+ 也逐张设计：重试常只挑其中一两张，各张版式不同，复用一份会串版式
+        if t == "scene_person" or t.startswith("aplus"):
             design_jobs.append((pos, t, ratio, seq))
         elif t not in seen_types:
             seen_types.add(t)
@@ -2177,12 +3515,25 @@ def _retry_relay_items(
                 relay.PERSON_VARIATIONS[seq % len(relay.PERSON_VARIATIONS)]
                 if t == "scene_person" else None
             )
+            lay = _item_layout(snapshot[pos][1])
+            lay_bytes: Optional[bytes] = None
+            if _layout_has_image(lay):
+                try:
+                    lay_bytes = _fetch_url_bytes(lay["image_url"])
+                except Exception as e:
+                    logger.warning(f"[AI生图] 任务 {task_id} 重试版式图取回失败: {e}")
+            # 与首次生成同一套清洗：重试也必须把「标题/文案/文字区」改写成留白
+            retry_hint = ((lay.get("structure") or "") if lay else "")
+            if retry_hint and t.startswith("aplus") and bool(snapshot[pos][1].get("no_text")):
+                retry_hint = _sanitize_structure_no_text(retry_hint)
             try:
                 return job, relay.design_shot_prompt(
                     datas[0][1], gen_type=t, ratio=ratio,
                     product_info=product_info, extra=extra_prompt,
                     brand_genes=brand_genes, prepared=prepared,
                     variation=variation,
+                    layout_bytes=lay_bytes,
+                    layout_hint=retry_hint,
                 )
             except Exception as e:
                 logger.warning(
@@ -2194,10 +3545,13 @@ def _retry_relay_items(
             for (pos, t, _r, _s), d in ex.map(_design, design_jobs):
                 if not d:
                     continue
-                if t == "scene_person":
+                if t == "scene_person" or t.startswith("aplus"):
                     designs_by_pos[pos] = d
                 elif t not in designs_by_type:
                     designs_by_type[t] = d
+
+    # 本次重试里哪些类型有多张（只有它们需要“彼此不同”的提示）
+    _retry_multi_types = _multi_shot_types([(it.get("type") or "",) for _i, it in snapshot])
 
     for pos, (_idx, it) in enumerate(snapshot):
         idx = _idx
@@ -2221,13 +3575,18 @@ def _retry_relay_items(
             if neg:
                 prompt_text += f"\n\nAvoid: {neg}"
         else:
+            lay = _item_layout(it)
+            has_struct = bool(lay and lay.get("structure"))
             prompt_text = _build_prompt(
                 t, product_info, extra_prompt, brand_genes,
-                variation=(
-                    PERSON_VARIATIONS_CN[int(it.get("seq") or 0) % len(PERSON_VARIATIONS_CN)]
-                    if t == "scene_person" else None
-                ),
+                multi_shot=(t in _retry_multi_types),
+                no_text=bool(it.get("no_text")),
+                layout_structure=(lay.get("structure") if has_struct else ""),
+                layout_with_image=bool(lay and _layout_has_image(lay)),
             )
+            if lay and not has_struct:
+                from services import ai_image_layout_service as layout_svc
+                prompt_text += layout_svc.layout_clause(lay, no_text=bool(it.get("no_text")))
         prompt_text += f"\n\n画面比例 {ratio}。只输出生成后的图片，不要输出任何文字说明。"
         if t != "selling_point":
             prompt_text += "\n画面中不得出现任何文字、标签、价签、水印或标识。"
@@ -2266,8 +3625,7 @@ def _retry_relay_items(
 
     _clear_cancel(task_id)
     token = _new_run_token(task_id)
-    with _lock:
-        _running.add(task_id)
+    # 执行槽已由 retry_image_items 抢占（同一任务禁止并行重试）；线程在 finally 释放
     threading.Thread(
         target=_run_relay_retry, args=(task_id, plan, datas[0][1], token),
         daemon=True, name=f"ai-image-retry-relay-{task_id}",
@@ -2330,9 +3688,8 @@ def _run_relay_retry(
         _update_task(task_id, status="失败", error_message=str(e)[:900],
                      finished_at=datetime.now())
     finally:
-        with _lock:
-            _running.discard(task_id)
-            _cancel_flags.discard(task_id)
+        _release_task_slot(task_id)
+        _clear_cancel(task_id)
 
 
 def retry_image_items(tenant_id: int, task_id: int,
@@ -2378,99 +3735,189 @@ def retry_image_items(tenant_id: int, task_id: int,
         except Exception:
             brand = None
         brand_genes = _compile_brand_genes(brand)
+        stored_brand_name = str((brand or {}).get("brand_name") or "") if isinstance(brand, dict) else ""
         main_ratio = task.main_aspect_ratio or task.aspect_ratio or "1:1"
         provider = getattr(task, "provider", None) or "local"
         snapshot = [(i, dict(items[i])) for i in targets]
     finally:
         db.close()
 
-    # 参考图：TOS 下载 → 重新上传 ComfyUI（上传的临时文件不长期保留）
-    datas: List[Tuple[str, bytes]] = []
-    # 直连：走系统代理时隧道抖动会把下载拖到超时
-    _http = requests.Session()
-    _http.trust_env = False
-    for u in image_urls:
-        try:
-            resp = _http.get(u, timeout=60)
-            resp.raise_for_status()
-        except Exception as e:
-            raise AIImageError(f"参考图下载失败，请重新提交任务: {e}")
-        datas.append((u.rsplit("/", 1)[-1] or "ref.jpg", resp.content))
+    # 抢占执行槽必须在任何子项状态变更之前：否则与上一轮线程的收尾阶段交错时，
+    # 新提交的 pid 会无人轮询，任务永远停在「生成中」。
+    if not _claim_task_slot(task_id):
+        raise AIImageError("任务正在执行中，请稍后再试")
 
-    # 主参考图必须是清晰的那张（与首次生成同口径，否则重试结果会再次跑偏）
-    datas = _order_images_by_clarity(datas)
-
-    # 中转站任务必须回中转站重试：换成本地 ComfyUI 会换模型、换风格，还要抢串行队列
-    if provider == "relay":
-        return _retry_relay_items(
-            task_id, snapshot, datas, product_info, extra_prompt, brand_genes, main_ratio,
-        )
-
-    # datas 元素是 (filename, bytes)，上传只需要 bytes（勿把元组当内容传进去）
-    image_names = [_upload_image(i, _c) for i, (_n, _c) in enumerate(datas)]
-
-    prompt_map: Dict[str, int] = {}
-    prompt_text_map: Dict[int, str] = {}
-    failed: List[str] = []
-    for idx, it in snapshot:
-        t = it.get("type") or ""
-        if t in APLUS_SPECS:
-            ratio = APLUS_SPECS[t]["gen_ratio"]
-            mp = float(APLUS_SPECS[t].get("megapixels") or DEFAULT_MEGAPIXELS)
-        elif t in MAIN_GEN_TYPES:
-            ratio = main_ratio
-            mp = DEFAULT_MEGAPIXELS
-        else:
-            failed.append(f"{t} 类型已不支持")
-            continue
-        prompt_text = _build_prompt(t, product_info, extra_prompt, brand_genes)
-        if it.get("no_text"):
-            prompt_text += "\n无文字模式：画面中不要出现任何文字、标语、水印或标识。"
-        try:
-            wf = _build_workflow(
-                prompt=prompt_text,
-                aspect_ratio=ratio,
-                seed=random.randint(1, 2**31 - 1),
-                image_names=image_names,
-                filename_prefix=f"AIIMG-{task_id}-{t}-{it.get('seq', idx)}-retry",
-                megapixels=mp,
-            )
-            resp = _api("POST", "/prompt", json={"prompt": wf})
-            prompt_map[resp.json()["prompt_id"]] = idx
-            prompt_text_map[idx] = prompt_text
-        except AIImageError:
-            raise
-        except Exception as e:
-            failed.append(f"{t}: {e}")
-
-    if not prompt_map:
-        raise AIImageError("重试提交失败：" + "；".join(failed[:3] or ["未知原因"]))
-
-    # 落库：目标子项回到排队中，任务回到生成中
-    db = SessionLocal()
+    started = False
     try:
-        task = db.query(AIImageTask).filter(AIImageTask.id == task_id).first()
-        items = _read_json_list(task.result_images if task else None)
-        for pid, idx in prompt_map.items():
-            if idx < len(items):
-                items[idx] = dict(
-                    items[idx], status="排队中", error=None, url=None,
-                    prompt_id=pid,
-                    final_prompt=prompt_text_map.get(idx),
-                    retried_at=datetime.now().strftime("%Y-%m-%d %H:%M"),
-                )
-        db.query(AIImageTask).filter(AIImageTask.id == task_id).update({
-            "result_images": _dump_items(items),
-            "status": _aggregate_status(items),
-            "finished_at": None,
-        })
-        db.commit()
-    finally:
-        db.close()
+        # 参考图：TOS 下载 → 重新上传 ComfyUI（上传的临时文件不长期保留）
+        datas: List[Tuple[str, bytes]] = []
+        # 直连：走系统代理时隧道抖动会把下载拖到超时
+        _http = requests.Session()
+        _http.trust_env = False
+        for u in image_urls:
+            try:
+                resp = _http.get(u, timeout=60)
+                resp.raise_for_status()
+            except Exception as e:
+                raise AIImageError(f"参考图下载失败，请重新提交任务: {e}")
+            datas.append((u.rsplit("/", 1)[-1] or "ref.jpg", resp.content))
 
-    _clear_cancel(task_id)
-    _ensure_worker(task_id, list(prompt_map.keys()), index_map=prompt_map)
-    return {"retried": len(prompt_map), "failed": failed}
+        # 主参考图必须是清晰的那张（与首次生成同口径，否则重试结果会再次跑偏）
+        datas = _order_images_by_clarity(datas)
+
+        # 中转站任务必须回中转站重试：换成本地 ComfyUI 会换模型、换风格，还要抢串行队列
+        if provider == "relay":
+            result = _retry_relay_items(
+                task_id, snapshot, datas, product_info, extra_prompt, brand_genes, main_ratio,
+            )
+            started = True
+            return result
+
+        # datas 元素是 (filename, bytes)，上传只需要 bytes（勿把元组当内容传进去）
+        image_names = [_upload_image(i, _c) for i, (_n, _c) in enumerate(datas)]
+
+        # A+ 提示词通道实验：重试与首次同口径（否则重试会静默退回旧链路）
+        aplus_mode = (getattr(settings, "IMAGE_APLUS_PROMPT_MODE", "") or "").strip().lower()
+        aplus_wf_path = _resolve_aplus_workflow()
+
+        prompt_map: Dict[str, int] = {}
+        prompt_text_map: Dict[int, str] = {}
+        failed: List[str] = []
+        for idx, it in snapshot:
+            t = it.get("type") or ""
+            if t in APLUS_SPECS:
+                ratio = APLUS_SPECS[t]["gen_ratio"]
+                mp = float(APLUS_SPECS[t].get("megapixels") or DEFAULT_MEGAPIXELS)
+            elif t in MAIN_GEN_TYPES:
+                ratio = main_ratio
+                mp = DEFAULT_MEGAPIXELS
+            else:
+                failed.append(f"{t} 类型已不支持")
+                continue
+            is_banner = t == "aplus_banner"
+            banner_brand = ""
+            if is_banner:
+                # 品牌名优先取子项快照（创建任务时固化），其次回退 brand_settings
+                banner_brand = _normalize_brand_name(it.get("brand_name") or stored_brand_name)
+                if not banner_brand:
+                    failed.append(f"{t} 品牌名已丢失，请重新提交任务")
+                    continue
+                prompt_text = _build_prompt(t, product_info, extra_prompt, brand_genes,
+                                            no_text=True, brand_name=banner_brand)
+            else:
+                prompt_text = _build_prompt(t, product_info, extra_prompt, brand_genes,
+                                            no_text=bool(it.get("no_text")))
+            # 版式必须复现：重试单独一张时也要用当初那个版式，否则重试结果和其余张版式不一致
+            use_names = image_names
+            lay = None if is_banner else _item_layout(it)
+            if lay and lay.get("structure"):
+                # 版式版正文：重新构建，替换掉自由构图条款
+                prompt_text = _build_prompt(t, product_info, extra_prompt, brand_genes,
+                                            no_text=bool(it.get("no_text")),
+                                            layout_structure=lay["structure"],
+                                            layout_with_image=_layout_has_image(lay))
+            else:
+                prompt_text = _build_prompt(t, product_info, extra_prompt, brand_genes,
+                                            no_text=bool(it.get("no_text")))
+            if lay:
+                from services import ai_image_layout_service as layout_svc
+                ref_name: Optional[str] = None
+                if _layout_has_image(lay) and not (lay.get("structure") or "").strip():
+                    try:
+                        ref_name = _upload_image(900 + idx, _fetch_url_bytes(lay["image_url"]))
+                    except Exception as e:
+                        logger.warning(f"[AI生图] 任务 {task_id} 重试版式图上传失败: {e}")
+                if not (lay.get("structure")):
+                    prompt_text += layout_svc.layout_clause(
+                        lay, no_text=bool(it.get("no_text")),
+                        ref_index=(len(image_names) + 1) if ref_name else None,
+                    )
+                if ref_name:
+                    use_names = image_names + [ref_name]
+            wf_path = None
+            contract = None
+            encode_images = True
+            if is_banner:
+                wf_path = settings.IMAGE_BRAND_BANNER_WORKFLOW_PATH
+                encode_images = False
+            elif t.startswith("aplus") and aplus_wf_path:
+                if aplus_mode == "append":
+                    # P4.1：重试必须复现创建任务时的契约，不得按当前模板重新生成
+                    contract = lay.get("layout_contract") or _layout_contract(lay, t, bool(it.get("no_text")))
+                    if contract is not None:
+                        wf_path = aplus_wf_path
+                    else:
+                        logger.warning(
+                            f"[AI生图] 任务 {task_id} 重试子项 {t}#{it.get('seq', idx)} "
+                            f"无版式结构，append 契约不可用，回退默认工作流"
+                        )
+                else:
+                    wf_path = aplus_wf_path
+            try:
+                wf = _build_workflow(
+                    prompt=prompt_text,
+                    aspect_ratio=ratio,
+                    seed=random.randint(1, 2**31 - 1),
+                    image_names=use_names,
+                    filename_prefix=f"AIIMG-{task_id}-{t}-{it.get('seq', idx)}-retry",
+                    megapixels=mp,
+                    workflow_path=wf_path,
+                    layout_contract=contract,
+                    encode_images=encode_images,
+                )
+                _wait_comfy_queue_slot(task_id)
+                resp = _api("POST", "/prompt", json={"prompt": wf})
+                prompt_map[resp.json()["prompt_id"]] = idx
+                prompt_text_map[idx] = prompt_text
+            except AIImageError:
+                raise
+            except Exception as e:
+                failed.append(f"{t}: {e}")
+
+        if not prompt_map:
+            raise AIImageError("重试提交失败：" + "；".join(failed[:3] or ["未知原因"]))
+
+        # 落库：目标子项回到排队中，任务回到生成中。
+        # comfy_prompt_ids 必须按子项下标同步更新：重启恢复只认这份任务级列表，
+        # 不同步会导致重试中的子项在重启后无人轮询；详情页的历史提示词归属校验也依赖它。
+        db = SessionLocal()
+        try:
+            task = db.query(AIImageTask).filter(AIImageTask.id == task_id).first()
+            if not task:
+                raise AIImageError("任务不存在或已删除")
+            items = _read_json_list(task.result_images)
+            pids = _read_json_list(task.comfy_prompt_ids)
+            if not pids:
+                pids = [str(it.get("prompt_id") or "") for it in items]
+            if len(pids) < len(items):
+                pids.extend([""] * (len(items) - len(pids)))
+            pids = pids[:len(items)]
+            for pid, idx in prompt_map.items():
+                if idx < len(items):
+                    pids[idx] = pid
+                    items[idx] = dict(
+                        items[idx], status="排队中", error=None, url=None,
+                        prompt_id=pid,
+                        final_prompt=prompt_text_map.get(idx),
+                        retried_at=datetime.now().strftime("%Y-%m-%d %H:%M"),
+                    )
+            db.query(AIImageTask).filter(AIImageTask.id == task_id).update({
+                "result_images": _dump_items(items),
+                "comfy_prompt_ids": json.dumps(pids, ensure_ascii=False),
+                "status": _aggregate_status(items),
+                "finished_at": None,
+            })
+            db.commit()
+        finally:
+            db.close()
+
+        _clear_cancel(task_id)
+        _start_task_thread(task_id, list(prompt_map.keys()), index_map=prompt_map)
+        started = True
+        return {"retried": len(prompt_map), "failed": failed}
+    finally:
+        if not started:
+            _release_task_slot(task_id)
 
 
 def build_task_zip(tenant_id: int, task_id: int) -> Tuple[bytes, str]:
@@ -2572,7 +4019,22 @@ def resume_pending_tasks() -> None:
             )
             .all()
         )
-        pending = [(r.id, _read_json_list(r.comfy_prompt_ids)) for r in rows]
+        pending = [(r.id, r.user_id, _read_json_list(r.comfy_prompt_ids)) for r in rows]
+
+        # 中转站任务的子项在生成前已落库（含提示词），重启后按提示词补跑；
+        # 绝不能走下面的「无 ComfyUI 任务 ID → 判失败」分支（那会丢掉远端已出的图）。
+        relay_rows = (
+            db.query(AIImageTask)
+            .filter(
+                AIImageTask.status.in_(["排队中", "生成中"]),
+                AIImageTask.provider == "relay",
+                AIImageTask.deleted_at.is_(None),
+            )
+            .all()
+        )
+        relay_owners = {r.id: r.user_id for r in relay_rows}
+        relay_ids = set(relay_owners)
+        pending = [(tid, uid, pids) for tid, uid, pids in pending if tid not in relay_ids]
 
         # 未拿到 ComfyUI 任务 ID 的记录已无法追踪，直接标记失败。
         # 必须连子项一起落终态：只改任务级会让子项永远停在「排队中」，
@@ -2586,6 +4048,7 @@ def resume_pending_tasks() -> None:
             )
             .all()
         )
+        orphan_rows = [r for r in orphan_rows if r.id not in relay_ids]
         for row in orphan_rows:
             items = _read_json_list(row.result_images)
             touched = False
@@ -2605,7 +4068,16 @@ def resume_pending_tasks() -> None:
     finally:
         db.close()
 
-    for task_id, pids in pending:
-        if pids:
-            logger.info(f"[AI生图] 恢复未完成任务 {task_id}（{len(pids)} 个子任务）")
-            _ensure_worker(task_id, pids)
+    for task_id, user_id, pids in pending:
+        # 按下标建映射：重试可能把某些位置写成空串占位，过滤时不能改变其余项的位置
+        index_map = {p: i for i, p in enumerate(pids) if p}
+        if index_map:
+            logger.info(f"[AI生图] 恢复未完成任务 {task_id}（{len(index_map)} 个子任务）")
+            _mark_task_resumed(task_id, user_id)
+            _ensure_worker(task_id, list(index_map.keys()), index_map=index_map)
+
+    for task_id in sorted(relay_ids):
+        logger.info(f"[AI生图] 恢复中转站任务 {task_id}（按已存提示词补跑）")
+        _mark_task_resumed(task_id, relay_owners[task_id])
+        if not _ensure_relay_resume_worker(task_id):
+            logger.info(f"[AI生图] 任务 {task_id} 已有执行在跑，跳过重启恢复")

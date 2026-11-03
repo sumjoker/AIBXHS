@@ -322,28 +322,35 @@ const MainLayout: React.FC<MainLayoutProps> = ({ children }) => {
           icon: <Target size={20} />,
           label: '选品机器人',
         }] : []),
-    ...(hasPermission('ai_video:use')
+    ...(hasPermission('ai_video:use') || hasPermission('ai_image:use')
       ? [{
           key: 'media-creation',
           icon: <Sparkles size={20} />,
           label: '媒体创作中心',
           shortLabel: '媒体',
           children: [
-            {
-              key: '/ai-creation',
-              icon: <Video size={18} />,
-              label: 'AI视频',
-            },
-            {
-              key: '/ai-image',
-              icon: <ImageIcon size={18} />,
-              label: 'AI生图',
-            },
-            {
-              key: '/upscale-center',
-              icon: <Film size={18} />,
-              label: '高清处理',
-            },
+            ...(hasPermission('ai_video:use')
+              ? [{
+                  key: '/ai-creation',
+                  icon: <Video size={18} />,
+                  label: 'AI视频',
+                }]
+              : []),
+            // AI生图有独立权限码：只给美工开生图、不给视频时也要能进
+            ...(hasPermission('ai_image:use')
+              ? [{
+                  key: '/ai-image',
+                  icon: <ImageIcon size={18} />,
+                  label: 'AI生图',
+                }]
+              : []),
+            ...(hasPermission('ai_video:use')
+              ? [{
+                  key: '/upscale-center',
+                  icon: <Film size={18} />,
+                  label: '高清处理',
+                }]
+              : []),
             ...(hasPermission('ai_video:approve')
               ? [{
                   key: '/video-binding-review',
