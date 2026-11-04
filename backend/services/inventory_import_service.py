@@ -582,22 +582,28 @@ def _do_import(file_path: str = None, file_content: bytes = None, filename: str 
                 db.commit()
                 _log(f"  孤儿在途详情软删除: {len(orphan_inbound_ids)} 条")
             
-            # fba_inbound 校验修正
+            # fba_inbound 校验修正（集合式：一条 JOIN UPDATE 替代原来的「逐行 2 条 SQL」，
+            # 覆盖范围与逐行版完全一致 = 本批次涉及的在途快照 all_sids，业务语义不变）
             _log("fba_inbound 校验修正...")
-            for sid in all_sids:
-                sum_qty = db.execute(text(
-                    f"SELECT COALESCE(SUM(quantity), 0) FROM inbound_shipment_details WHERE snapshot_id = {sid} AND deleted_at IS NULL"
-                )).scalar() or 0
-                old_val = db.execute(text(
-                    f"SELECT fba_inbound FROM inventory_snapshots WHERE id = {sid} AND deleted_at IS NULL"
-                )).scalar()
-                if old_val is not None and old_val != sum_qty:
-                    db.execute(text(
-                        f"UPDATE inventory_snapshots SET fba_inbound = {sum_qty} WHERE id = {sid} AND deleted_at IS NULL"
-                    ))
-                    db.commit()
-                    _log(f"  fba_inbound 校验修正: snapshot_id={sid}, {old_val} → {sum_qty}")
-            
+            if all_sids:
+                sid_list = ",".join(str(sid) for sid in all_sids)
+                fix_result = db.execute(text(f"""
+                    UPDATE inventory_snapshots s
+                    LEFT JOIN (
+                        SELECT snapshot_id, SUM(quantity) AS qty
+                        FROM inbound_shipment_details
+                        WHERE deleted_at IS NULL
+                        GROUP BY snapshot_id
+                    ) d ON d.snapshot_id = s.id
+                    SET s.fba_inbound = COALESCE(d.qty, 0)
+                    WHERE s.id IN ({sid_list})
+                      AND s.deleted_at IS NULL
+                      AND COALESCE(s.fba_inbound, 0) <> COALESCE(d.qty, 0)
+                """))
+                db.commit()
+                if fix_result.rowcount:
+                    _log(f"  fba_inbound 校验修正: 共修正 {fix_result.rowcount} 行")
+
             _log(f"inbound_shipment_details UPSERT完成: 更新{updated_inbound} 新增{inserted_inbound}")
         else:
             _log("没有在途详情需要导入")
