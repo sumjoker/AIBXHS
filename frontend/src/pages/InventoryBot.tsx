@@ -2533,6 +2533,8 @@ const InventoryBot: React.FC = () => {
           return null;
         }
         const isSummary = record.summary_flag === "是";
+        // 在途为 0（无货件明细）时「在途详情」不可点，只给提示
+        const noInbound = (record.fba_inbound || 0) <= 0;
         const confirmMessage = (action: string) => {
           let msg = `确定要${action}该商品吗？`;
           if (isSummary) {
@@ -2542,14 +2544,28 @@ const InventoryBot: React.FC = () => {
         };
         return (
           <Space size={4} style={{ flexWrap: "nowrap", whiteSpace: "nowrap" }}>
-            <Button
-              type="link"
-              size="small"
-              icon={<Truck size={14} />}
-              onClick={() => handleViewInbound(record.asin, record.account)}
-            >
-              在途详情
-            </Button>
+            {/* 在途为 0 时无货件可查：按钮置灰不可点，并给出「无在途货件」提示。
+                antd v5 的 Tooltip 不会自动包裹 disabled 子元素（浏览器不给 disabled 控件派发鼠标事件），
+                因此这里用 span 承接 hover，按钮本身 pointer-events:none，保证提示始终可见。 */}
+            <Tooltip title={noInbound ? "无在途货件" : ""}>
+              <span
+                style={{
+                  display: "inline-block",
+                  cursor: noInbound ? "not-allowed" : "default",
+                }}
+              >
+                <Button
+                  type="link"
+                  size="small"
+                  icon={<Truck size={14} />}
+                  disabled={noInbound}
+                  style={noInbound ? { pointerEvents: "none" } : undefined}
+                  onClick={() => handleViewInbound(record.asin, record.account)}
+                >
+                  在途详情
+                </Button>
+              </span>
+            </Tooltip>
             {record.force_replenish === 1 ? (
               // 与「强制补货」按钮同结构（icon + 4 字），保证两态等宽 —— 否则第 3 槽
               // 「标记」的 X 位置随行漂移（实测 22px，操作列横向不对齐的根因）。
