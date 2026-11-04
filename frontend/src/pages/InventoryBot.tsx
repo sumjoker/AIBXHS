@@ -595,6 +595,7 @@ const InventoryBot: React.FC = () => {
     { label: "在途", value: "fba_inbound" },
     { label: "查验货件数量", value: "inspection_quantity" },
     { label: "本地仓库存", value: "local_inventory" },
+    { label: "海外仓库存", value: "overseas_inventory" },
     { label: "总库存", value: "total_stock" },
     { label: "毛利率", value: "gross_margin" },
     { label: "30天退货率", value: "return_rate_30d" },

@@ -2005,6 +2005,7 @@ def export_inventory_to_excel(items: list, fields: list = None):
         "fba_inbound_processing": "入库中",
         "fba_inbound": "在途",
         "local_inventory": "本地仓库存",
+        "overseas_inventory": "海外仓库存",
         "total_stock": "总库存",
         "gross_margin": "毛利率",
         "return_rate_30d": "30天退货率",
