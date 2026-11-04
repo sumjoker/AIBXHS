@@ -55,6 +55,7 @@ import {
   Rocket,
   Video,
   Film,
+  Image as ImageIcon,
   ClipboardCheck,
 } from "lucide-react";
 import { useAuth } from "../../contexts/AuthContext";
@@ -213,7 +214,7 @@ const MainLayout: React.FC<MainLayoutProps> = ({ children }) => {
     "/tenants",
     "/stores",
   ];
-  const mediaPaths = ["/ai-creation"];
+  const mediaPaths = ["/ai-creation", "/ai-image"];
 
   const [openKeys, setOpenKeys] = useState<string[]>(() => {
     const currentPath = location.pathname;
@@ -321,28 +322,40 @@ const MainLayout: React.FC<MainLayoutProps> = ({ children }) => {
           icon: <Target size={20} />,
           label: '选品机器人',
         }] : []),
-    ...(hasPermission('ai_video:use')
+    ...(hasPermission('ai_video:use') || hasPermission('ai_image:use')
       ? [{
           key: 'media-creation',
           icon: <Sparkles size={20} />,
           label: '媒体创作中心',
           shortLabel: '媒体',
           children: [
-            {
-              key: '/ai-creation',
-              icon: <Video size={18} />,
-              label: 'AI视频',
-            },
-            {
-              key: '/upscale-center',
-              icon: <Film size={18} />,
-              label: '高清处理',
-            },
+            ...(hasPermission('ai_video:use')
+              ? [{
+                  key: '/ai-creation',
+                  icon: <Video size={18} />,
+                  label: 'AI视频',
+                }]
+              : []),
+            // AI生图有独立权限码：只给美工开生图、不给视频时也要能进
+            ...(hasPermission('ai_image:use')
+              ? [{
+                  key: '/ai-image',
+                  icon: <ImageIcon size={18} />,
+                  label: 'AI生图',
+                }]
+              : []),
+            ...(hasPermission('ai_video:use')
+              ? [{
+                  key: '/upscale-center',
+                  icon: <Film size={18} />,
+                  label: '高清处理',
+                }]
+              : []),
             ...(hasPermission('ai_video:approve')
               ? [{
                   key: '/video-binding-review',
                   icon: <ClipboardCheck size={18} />,
-                  label: '视频绑定审核',
+                  label: '媒体绑定审核',
                 }]
               : []),
           ],
@@ -549,8 +562,9 @@ const MainLayout: React.FC<MainLayoutProps> = ({ children }) => {
       "/development": "开发机器人",
       "/development/new": "添加新品",
       '/ai-creation': 'AI视频',
+      '/ai-image': 'AI生图',
       '/upscale-center': '高清处理',
-      '/video-binding-review': '视频绑定审核',
+      '/video-binding-review': '媒体绑定审核',
     };
     return pathMap[location.pathname] || "未知页面";
   };

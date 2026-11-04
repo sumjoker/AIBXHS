@@ -601,6 +601,24 @@ def _do_import(file_path: str = None, file_content: bytes = None, filename: str 
             _log(f"inbound_shipment_details UPSERT完成: 更新{updated_inbound} 新增{inserted_inbound}")
         else:
             _log("没有在途详情需要导入")
+
+        # ========== 步骤6.1: 清理「无在途文本」快照下的历史残留明细 ==========
+        # 某行从"有在途文本"变为"无文本"时，快照是原地 UPSERT（id 不变），
+        # 上面的孤儿清理只覆盖本批有明细写入的快照，旧明细会永久残留。
+        # 这里按「本次导入的租户 + 快照日期」做一次集合式清理，与按 key 比对的清理互补。
+        cleanup_result = db.execute(text("""
+            UPDATE inbound_shipment_details d
+            JOIN inventory_snapshots s ON s.id = d.snapshot_id
+            SET d.deleted_at = NOW()
+            WHERE s.tenant_id = :tid
+              AND s.snapshot_date = :sdate
+              AND s.deleted_at IS NULL
+              AND d.deleted_at IS NULL
+              AND (s.fba_inbound_detail IS NULL OR TRIM(s.fba_inbound_detail) IN ('', 'nan'))
+        """), {"tid": tenant_id, "sdate": today})
+        db.commit()
+        if cleanup_result.rowcount:
+            _log(f"无在途文本快照的残留明细清理: 软删除 {cleanup_result.rowcount} 条")
         
         _import_status["progress"] = 70
         

@@ -1,0 +1,80 @@
+{
+  "475": {
+    "inputs": {
+      "image": ""
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "参考图（探针）"
+    }
+  },
+  "532": {
+    "inputs": {
+      "upscale_method": "lanczos",
+      "megapixels": 1.5,
+      "resolution_steps": 32,
+      "image": [
+        "475",
+        0
+      ]
+    },
+    "class_type": "ImageScaleToTotalPixels",
+    "_meta": {
+      "title": "尺度对齐（与生产同参）"
+    }
+  },
+  "565": {
+    "inputs": {
+      "输入提示词": "",
+      "任务模式": "图生图",
+      "输出语言": "中文",
+      "增强方式": "本地官方PE",
+      "api_key": "",
+      "api_base_url": "",
+      "model": "",
+      "文生图PE模型": "qwen3.5_9b_qwen_image_2.1_pe_t2i.int8_convrot.safetensors",
+      "图生图PE模型": "qwen3.5_9b_qwen_image_2.1_pe_i2i.int8_convrot.safetensors",
+      "主模型": "Q35-4B-G-UD\\Qwen3.5-4B-UD-Q4_K_XL.gguf",
+      "mmproj": "Q35-4B-G-UD\\mmproj-Qwen3.5-4B-BF16.gguf",
+      "最大生成token": 4096,
+      "上下文长度": 16384,
+      "seed": 666,
+      "生成后自动卸载模型": false,
+      "启用思考": false,
+      "图片": [
+        "532",
+        0
+      ]
+    },
+    "class_type": "TE_Qwen_Image_2_1_Prompt_Enhancer",
+    "_meta": {
+      "title": "PE（不卸载，便于连续探针）"
+    }
+  },
+  "569": {
+    "inputs": {
+      "text": "",
+      "use_edited_text": false,
+      "input_text": [
+        "565",
+        0
+      ]
+    },
+    "class_type": "TE_text_display",
+    "_meta": {
+      "title": "PE 输出文本"
+    }
+  },
+  "900": {
+    "inputs": {
+      "source": [
+        "565",
+        0
+      ]
+    },
+    "class_type": "PreviewAny",
+    "_meta": {
+      "title": "PE 输出预览（兜底取文本）"
+    }
+  }
+}

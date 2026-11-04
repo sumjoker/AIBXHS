@@ -15,9 +15,10 @@ const statusMeta: Record<string, { label: string; color: string }> = {
 const sourceMeta: Record<string, { label: string; color: string }> = {
   ai_video: { label: 'AI视频', color: 'blue' },
   upscale: { label: '高清处理', color: 'purple' },
+  ai_image: { label: 'AI生图', color: 'green' },
 }
 
-/** 视频绑定审核：AI视频/高清处理「绑定至产品」申请的审核列表 */
+/** 媒体绑定审核：AI视频/高清处理/AI生图「绑定至产品」申请的审核列表 */
 const VideoBindingReview: React.FC = () => {
   const { hasPermission } = useAuth()
   const [statusFilter, setStatusFilter] = useState<string>('pending')
@@ -202,34 +203,48 @@ const VideoBindingReview: React.FC = () => {
 
   const columns = [
     {
-      title: '视频',
-      key: 'video',
+      title: '媒体',
+      key: 'media',
       width: 200,
-      render: (_: any, record: VideoBindingRequest) => (
-        <video
-          src={record.video_url}
-          muted
-          loop
-          playsInline
-          preload="metadata"
-          onMouseEnter={(e) => {
-            e.currentTarget.play().catch(() => {})
-          }}
-          onMouseLeave={(e) => {
-            e.currentTarget.pause()
-          }}
-          onClick={() => setPreviewItem(record)}
-          style={{
-            width: 176,
-            height: 99,
-            background: '#000',
-            borderRadius: 6,
-            display: 'block',
-            cursor: 'pointer',
-            objectFit: 'cover',
-          }}
-        />
-      ),
+      render: (_: any, record: VideoBindingRequest) => {
+        const src = record.media_url || record.video_url
+        const style = {
+          width: 176,
+          height: 99,
+          background: '#000',
+          borderRadius: 6,
+          display: 'block',
+          cursor: 'pointer',
+          objectFit: 'cover' as const,
+        }
+        if (record.media_type === 'image') {
+          return (
+            <img
+              src={src}
+              alt={record.task_title || '生成图片'}
+              onClick={() => setPreviewItem(record)}
+              style={{ ...style, objectFit: 'contain', background: '#f5f5f5' }}
+            />
+          )
+        }
+        return (
+          <video
+            src={src}
+            muted
+            loop
+            playsInline
+            preload="metadata"
+            onMouseEnter={(e) => {
+              e.currentTarget.play().catch(() => {})
+            }}
+            onMouseLeave={(e) => {
+              e.currentTarget.pause()
+            }}
+            onClick={() => setPreviewItem(record)}
+            style={style}
+          />
+        )
+      },
     },
     {
       title: '目标产品',
@@ -343,7 +358,7 @@ const VideoBindingReview: React.FC = () => {
   return (
     <div style={{ padding: 24, height: '100%', display: 'flex', flexDirection: 'column' }}>
       <Card
-        title="视频绑定审核"
+        title="媒体绑定审核"
         style={{ flex: 1, display: 'flex', flexDirection: 'column' }}
         styles={{ body: { padding: 16, flex: 1, display: 'flex', flexDirection: 'column' } }}
       >
@@ -406,11 +421,18 @@ const VideoBindingReview: React.FC = () => {
         centered
         destroyOnClose
         styles={{ body: { padding: 0, background: '#000' } }}
-        title={previewItem?.product_name || '视频预览'}
+        title={previewItem?.product_name || (previewItem?.media_type === 'image' ? '图片预览' : '视频预览')}
       >
-        {previewItem && (
+        {previewItem && previewItem.media_type === 'image' && (
+          <img
+            src={previewItem.media_url || previewItem.video_url}
+            alt={previewItem.task_title || '生成图片'}
+            style={{ width: '100%', height: '78vh', objectFit: 'contain', display: 'block', background: '#111' }}
+          />
+        )}
+        {previewItem && previewItem.media_type !== 'image' && (
           <video
-            src={previewItem.video_url}
+            src={previewItem.media_url || previewItem.video_url}
             controls
             autoPlay
             playsInline

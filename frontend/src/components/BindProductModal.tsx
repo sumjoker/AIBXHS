@@ -10,14 +10,21 @@ interface ProductOption {
 
 const PAGE_SIZE = 50
 
-/** 绑定视频至产品详情（AI视频页 / 高清处理页共用），选择产品后提交绑定申请，审核通过才真正写入产品 */
+/** 绑定媒体（视频/图片）至产品详情，选择产品后提交绑定申请，审核通过才真正写入产品 */
 const BindProductModal: React.FC<{
   open: boolean
-  videoUrl: string
-  source?: 'ai_video' | 'upscale'
+  /** 兼容旧调用：视频地址 */
+  videoUrl?: string
+  /** 待绑定的媒体地址（图片或视频），优先于 videoUrl */
+  mediaUrl?: string
+  /** video=写 products.videos（上限 6）/ image=写 products.images（上限 9） */
+  mediaType?: 'video' | 'image'
+  source?: 'ai_video' | 'upscale' | 'ai_image'
   taskTitle?: string
   onClose: () => void
-}> = ({ open, videoUrl, source = 'ai_video', taskTitle, onClose }) => {
+}> = ({ open, videoUrl = '', mediaUrl, mediaType = 'video', source = 'ai_video', taskTitle, onClose }) => {
+  const targetUrl = (mediaUrl || videoUrl || '').trim()
+  const isImage = mediaType === 'image'
   const [products, setProducts] = useState<ProductOption[]>([])
   const [productId, setProductId] = useState<number | null>(null)
   const [submitting, setSubmitting] = useState(false)
@@ -82,7 +89,7 @@ const BindProductModal: React.FC<{
   }
 
   const handleOk = async () => {
-    if (!productId || !videoUrl) {
+    if (!productId || !targetUrl) {
       message.warning('请先选择产品')
       return
     }
@@ -90,7 +97,8 @@ const BindProductModal: React.FC<{
     try {
       await videoBindingApi.submit({
         product_id: productId,
-        video_url: videoUrl,
+        video_url: targetUrl,
+        media_type: mediaType,
         source,
         task_title: taskTitle,
       })
@@ -106,7 +114,7 @@ const BindProductModal: React.FC<{
   return (
     <Modal
       open={open}
-      title="绑定至产品"
+      title={isImage ? '绑定图片至产品' : '绑定视频至产品'}
       okText="确定"
       cancelText="取消"
       centered

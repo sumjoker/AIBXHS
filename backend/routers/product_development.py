@@ -15,6 +15,7 @@
 - de_keywords      -> 德语关键词
 - development_date -> 采购日期
 """
+import asyncio
 import json
 import logging
 import random

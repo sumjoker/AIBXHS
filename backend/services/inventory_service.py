@@ -1813,6 +1813,13 @@ def get_inbound_details(db: Session, tenant_id: int, asin: str, account: str = N
     if not snapshot_ids:
         return []
 
+    # 快照在途数量为 0 时不应返回在途明细（历史快照可能残留未清理的明细行）
+    inbound_total = db.query(func.coalesce(func.sum(InventorySnapshot.fba_inbound), 0)).filter(
+        InventorySnapshot.id.in_(snapshot_ids)
+    ).scalar() or 0
+    if inbound_total <= 0:
+        return []
+
     details = db.query(InboundShipmentDetail).filter(
         InboundShipmentDetail.tenant_id == tenant_id,
         InboundShipmentDetail.snapshot_id.in_(snapshot_ids),

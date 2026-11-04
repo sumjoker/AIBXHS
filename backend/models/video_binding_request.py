@@ -10,7 +10,8 @@ class VideoBindingRequest(BaseModel):
 
     id = Column(Integer, primary_key=True, index=True, comment="请求ID")
     tenant_id = Column(Integer, nullable=False, index=True, comment="租户ID")
-    video_url = Column(String(1000), nullable=False, comment="视频公网地址（TOS）")
+    video_url = Column(String(1000), nullable=False, comment="媒体公网地址（TOS，video 存视频 / image 存图片）")
+    media_type = Column(String(10), nullable=False, default="video", comment="媒体类型：video=视频 / image=图片")
     product_id = Column(Integer, nullable=False, index=True, comment="目标产品ID")
     product_code = Column(String(100), nullable=True, comment="产品编码快照")
     product_name = Column(String(200), nullable=True, comment="产品名称快照")

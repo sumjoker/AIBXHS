@@ -597,6 +597,10 @@ def _prepare_and_run(
                 with_ref_note=not optimized_prompt,
                 person_picture=person_picture,
             )
+            # 生图优先：有生图任务在等 ComfyUI 时先让路（上限 COMFY_IMAGE_PRIORITY_WAIT_SECONDS）
+            from services import comfy_priority
+
+            comfy_priority.wait_before_enqueue("H3视频", task_id)
             resp = _api("POST", "/prompt", json={"prompt": workflow})
             h3_prompt_id = resp.json()["prompt_id"]
         except Exception as e:

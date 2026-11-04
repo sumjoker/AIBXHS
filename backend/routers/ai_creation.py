@@ -10,6 +10,7 @@ import time
 
 from fastapi.responses import Response, StreamingResponse
 from dependencies import get_current_user
+from config import get_settings
 from models.user import User
 from services.ai_creation_service import (
     analyze_product_images,
@@ -67,11 +68,12 @@ class GeneratePromptsRequest(BaseModel):
 ALLOWED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif", "image/bmp"}
 
 
-# 代理取图静态白名单后缀（后缀匹配）：亚马逊图片 CDN + 历史 volces.com 直连地址。
+# 代理取图静态白名单后缀（后缀匹配）：TOS 历史直连地址 + 自有 CDN + 亚马逊图片 CDN。
 # TOS 侧域名（自定义 CDN 域名 / 桶域名）由 _proxy_image_hosts 动态拼装，
-# 避免 .env 换域名后白名单失效导致代理取图被拒。
+# .env 的 PROXY_IMAGE_HOST_SUFFIXES 可追加额外域名，避免再改代码。
 PROXY_IMAGE_HOST_SUFFIXES = (
     "volces.com",             # 火山引擎 TOS（历史直连地址）
+    "bxhsrpa.com",            # 自有 CDN（产品图/生成图）
     "media-amazon.com",       # 亚马逊图片 CDN
     "ssl-images-amazon.com",  # 亚马逊图片 CDN（旧域名）
 )
@@ -79,11 +81,12 @@ PROXY_IMAGE_MAX_BYTES = 10 * 1024 * 1024
 
 
 def _proxy_image_hosts() -> set:
-    """代理白名单完整主机集合：静态后缀 + 当前 TOS 配置的自定义域名 / 桶域名"""
-    from config import get_settings
-
+    """代理白名单完整主机集合：静态后缀 + .env 追加项 + 当前 TOS 配置的自定义域名 / 桶域名"""
     hosts = set(PROXY_IMAGE_HOST_SUFFIXES)
     settings = get_settings()
+    extra = (settings.PROXY_IMAGE_HOST_SUFFIXES or "").strip()
+    if extra:
+        hosts.update(p.strip().lower().lstrip(".") for p in extra.split(",") if p.strip())
     if settings.TOS_CUSTOM_DOMAIN:
         host = urlparse(f"https://{settings.TOS_CUSTOM_DOMAIN.strip('/')}").hostname
         if host:
@@ -107,10 +110,14 @@ async def proxy_image(url: str, current_user: User = Depends(get_current_user)):
     host = parsed.hostname.lower()
     allowed = _proxy_image_hosts()
     if not any(host == h or host.endswith("." + h) for h in allowed):
-        raise HTTPException(status_code=400, detail="该图片域名不在代理白名单内")
+        raise HTTPException(
+            status_code=400,
+            detail=f"该图片域名不在代理白名单内（{host}），可在 .env 的 PROXY_IMAGE_HOST_SUFFIXES 追加",
+        )
 
     try:
-        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+        # trust_env=False：绕过系统/沙箱 HTTP 代理，避免隧道 502 把取图拖到超时
+        async with httpx.AsyncClient(timeout=30, follow_redirects=True, trust_env=False) as client:
             resp = await client.get(url)
             resp.raise_for_status()
             content_type = resp.headers.get("content-type", "").split(";")[0].strip()
@@ -544,9 +551,15 @@ async def analyze_product(
     if not result:
         raise HTTPException(status_code=500, detail="AI 分析结果为空，请稍后重试")
 
+    # 同时返回「已格式化文本」：与 AI 生图中转站自动分析用的是同一个 _card_to_text，
+    # 让前端「AI 分析」按钮与后端自动补全产出同一套字段（含组件/尺寸/使用方式/风格倾向），
+    # 避免前端自己再映射一遍导致两边漂移（2026-10-28：local 曾只有 6 字段、relay 有 11 字段）。
+    from services.ai_image_service import _card_to_text  # 局部导入，规避模块级循环依赖
+
     return {
         "success": True,
         "data": result,
+        "text": _card_to_text(result or {}),
     }
 
 

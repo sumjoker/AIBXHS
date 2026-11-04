@@ -1,0 +1,76 @@
+{
+ "product_name_cn": "E-水母1岁横幅",
+ "product_name_en": "E-Jellyfish ONE YEAR LATER 1st Birthday Banner and Balloon Decoration Set",
+ "product_type": "一岁生日横幅与气球装饰套装",
+ "product_size": "字母约4.7英寸/12厘米高、3.7英寸/9.5厘米宽；水母装饰约5.1英寸/13厘米高、3.6英寸/9.2厘米宽；气球直径约12英寸/30厘米",
+ "target_audience": [
+  "一岁生日派对主办者",
+  "儿童家长",
+  "生日派对装饰布置者"
+ ],
+ "selling_points": [
+  "横幅包含可见的“ONE YEAR LATER”金色字母",
+  "搭配蓝色、紫色和粉色花朵及水母图案装饰",
+  "包含黄色、深蓝色和浅蓝色气球",
+  "图片标示气球尺寸约12英寸/30厘米",
+  "适合用于一岁生日派对背景装饰"
+ ],
+ "material": [
+  "图片无法确认"
+ ],
+ "usage_scenarios": [
+  "一岁生日派对",
+  "室内生日背景布置",
+  "儿童生日拍照区"
+ ],
+ "usage_methods": [
+  "将横幅悬挂在墙面或背景区域",
+  "将充气气球与横幅搭配布置"
+ ],
+ "product_components": [
+  "ONE YEAR LATER 文字横幅",
+  "花朵图案装饰",
+  "水母图案装饰",
+  "黄色气球",
+  "深蓝色气球",
+  "浅蓝色气球"
+ ],
+ "colors": [
+  "金色",
+  "蓝色",
+  "紫色",
+  "粉色",
+  "黄色"
+ ],
+ "amazon_category": "Home & Kitchen > Party Supplies > Decorations > Banners",
+ "keywords": [
+  "1st birthday banner",
+  "one year later banner",
+  "jellyfish birthday decorations",
+  "underwater birthday party",
+  "first birthday party decor",
+  "birthday balloon decoration set"
+ ],
+ "visible_text": [
+  "ONE",
+  "YEAR",
+  "LATER",
+  "12inch/30cm",
+  "5.1inch/13cm",
+  "3.6inch/9.2cm",
+  "4.7inch/12cm",
+  "3.7inch/9.5cm",
+  "×1",
+  "×4"
+ ],
+ "confidence": 0.98,
+ "uncertain_information": [
+  "横幅整体展开尺寸无法从图片确认",
+  "产品材质无法从图片确认",
+  "图片中部分组件的准确数量无法确认",
+  "气球是否包含充气工具、绳子或其他安装配件无法从图片确认",
+  "气球是否可重复使用无法从图片确认",
+  "产品是否适用于户外环境无法从图片确认"
+ ],
+ "style_context": "underwater birthday celebration"
+}

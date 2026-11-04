@@ -3,7 +3,7 @@ import base64
 import asyncio
 import logging
 import re
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from openai import OpenAI
 from fastapi import UploadFile
 
@@ -344,6 +344,96 @@ async def analyze_product_images(files: List[UploadFile]) -> Optional[Dict[str, 
         raise AIAnalysisError(f"无法解析 AI 返回内容为结构化数据: {raw_text[:200]}")
 
     return result
+
+
+def _build_user_content_from_bytes(items: List[Tuple[str, bytes]],
+                                   hint: str = "请根据以下商品图片进行 Amazon 产品信息分析。"
+                                   ) -> List[Dict[str, Any]]:
+    """与 `_build_user_content` 同口径，但入参是内存 bytes。
+
+    生图/中转站链路拿不到 UploadFile（参考图在后台线程里已是 bytes），
+    又不能为此复制一套 SYSTEM_PROMPT —— 两页必须共用同一套分析纪律，
+    否则同一张图会在两个页面得出不同商品结论。
+    """
+    content: List[Dict[str, Any]] = [{"type": "text", "text": hint}]
+    for name, raw in items:
+        try:
+            image_bytes, mime_type = _compress_image(raw, "image/jpeg")
+            content.append({
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:{mime_type};base64,{base64.b64encode(image_bytes).decode('utf-8')}",
+                },
+            })
+        except Exception as e:
+            logger.error(f"[AI创作中心] 读取图片失败 {name}: {e}")
+    return content
+
+
+def analyze_product_card(items: List[Tuple[str, bytes]], product_name: str = "") -> Dict[str, Any]:
+    """商品信息卡分析（生图通道复用生视频的完整口径）。
+
+    与 `analyze_product_images` 用**同一份 SYSTEM_PROMPT、同一温度、同一结构化格式**，
+    区别只有两点：
+    1. 入参形态（内存 bytes，后台线程拿不到 UploadFile）；
+    2. 追加两条生图场景的补充约束 —— **全部参考图一次全传**（单图会让模型只看一个
+       角度就编造：实测 175px 缩略图把「金色月桂皇冠 4 件套」认成「海滩度假套装」），
+       以及**不得推断民族/地域风格**（实测把月桂叶头冠+腰链+手镯认成「印度舞饰品」，
+       图上根本没有 India 字样，只是组合联想）。
+
+    :param items: [(文件名, 图片字节)]，按清晰度排好序
+    :param product_name: 系统里的产品名（用户选的品），作为命名锚点，避免模型另起风格
+    """
+    if not settings.OPENAI_API_KEY:
+        raise AIAnalysisError("OpenAI API Key 未配置")
+
+    hint_lines = ["请根据以下商品图片进行 Amazon 产品信息分析。本批共 {} 张图片，是同一商品的不同角度/细节图。".format(len(items))]
+    if (product_name or "").strip():
+        hint_lines.append(
+            f"该商品在系统中的名称是「{product_name.strip()}」，命名请以此为准；"
+            f"不要改成其他民族/地域风格（如印度风、波西米亚风）的命名。"
+            f"若图片与这个名称存在冲突，请把冲突写进 uncertain_information。"
+        )
+    hint_lines.append(
+        "额外约束：只写图片上能直接看到的信息。不要根据「头饰+腰链+手镯」这类组合去推断"
+        "民族文化或舞蹈风格；品类只写功能性描述（例如「头饰腰链手镯四件套」）。"
+    )
+    hint_lines.append(
+        "再补充一个字段 style_context：用 2-4 个英文词描述该商品所属的风格/时代/节庆氛围"
+        "（例如 greek classical、vintage christmas、modern everyday、outdoor garden wedding）。"
+        "必须能从商品本身或商品名看出来；看不出明确风格就写 modern everyday，不要硬套。"
+    )
+    content = _build_user_content_from_bytes(items, hint="\n".join(hint_lines))
+    if len(content) <= 1:
+        raise AIAnalysisError("没有可用的图片内容")
+
+    client = OpenAI(
+        api_key=settings.OPENAI_API_KEY,
+        base_url=settings.OPENAI_API_BASE,
+        max_retries=0,      # 与生视频一致：超时不自动重试，避免重复扣费
+        timeout=240,
+    )
+    model = settings.OPENAI_VISION_MODEL or "gpt-4o"
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": content},
+    ]
+
+    mode = (settings.OPENAI_VISION_RESPONSE_FORMAT or "json_object").lower()
+    response_format: Optional[Dict[str, Any]] = None
+    if mode == "json_schema":
+        response_format = AMAZON_PRODUCT_ANALYSIS_SCHEMA
+    elif mode == "json_object":
+        response_format = {"type": "json_object"}
+
+    logger.info(
+        f"[AI创作中心] 生图复用商品分析：模型 {model}，参考图 {len(content) - 1} 张，"
+        f"名称锚点={product_name or '无'}"
+    )
+    text = _create_chat_completion(client, model, messages, response_format=response_format)
+    if not text:
+        raise AIAnalysisError("AI 模型返回内容为空")
+    return parse_analysis_result(text) or {}
 
 
 def parse_analysis_result(raw_text: Optional[str]) -> Optional[Dict[str, Any]]:

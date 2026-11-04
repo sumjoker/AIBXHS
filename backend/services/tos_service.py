@@ -218,12 +218,14 @@ def bound_video_target_name(product_code: str, seq: int) -> str:
     return f"{product_code}_{seq}_{int(datetime.now().timestamp())}"
 
 
-def rename_file(src_url: str, new_name: str) -> str:
+def rename_file(src_url: str, new_name: str, subdir: str = "videos") -> str:
     """服务端复制对象为新名称（保留原对象），返回新公网 URL。
 
-    用于 AI视频/高清处理结果绑定产品时改名为「产品编码_序号」：
+    用于 AI视频/高清处理/AI生图 结果绑定产品时改名为「产品编码_序号」：
     仅在桶内复制（CopyObject），不下载上传大文件，也不删除源对象
-    （AI视频/高清处理任务历史仍引用源地址）。复制失败抛异常，由调用方决定回退。
+    （AI 任务历史仍引用源地址）。复制失败抛异常，由调用方决定回退。
+
+    :param subdir: 目标目录，video 用 "videos"、image 用 "images"（与产品直传命名保持一致）
     """
     from urllib.parse import urlparse, unquote
 
@@ -232,10 +234,10 @@ def rename_file(src_url: str, new_name: str) -> str:
 
     src_key = unquote(urlparse(src_url).path.lstrip("/"))
     _, ext = os.path.splitext(src_key)
-    ext = ext.lower() or ".mp4"
+    ext = ext.lower() or (".jpg" if subdir == "images" else ".mp4")
 
     prefix = (settings.TOS_PREFIX or "").strip("/")
-    new_key = f"{prefix}/videos/{new_name}{ext}" if prefix else f"videos/{new_name}{ext}"
+    new_key = f"{prefix}/{subdir}/{new_name}{ext}" if prefix else f"{subdir}/{new_name}{ext}"
 
     try:
         import tos

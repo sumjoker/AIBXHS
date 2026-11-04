@@ -33,6 +33,7 @@ import ProductDevelopmentBot from "./pages/ProductDevelopmentBot";
 import ProductDevelopmentCreate from "./pages/ProductDevelopmentCreate";
 import AICreationCenter from './pages/AICreationCenter';
 import UpscaleCenter from './pages/UpscaleCenter';
+import AIImageStudio from './pages/AIImageStudio';
 import VideoBindingReview from './pages/VideoBindingReview';
 import Login from "./pages/Login";
 import Register from "./pages/Register";
@@ -351,6 +352,16 @@ function AppRoutes() {
           <ProtectedRoute>
             <MainLayout>
               <UpscaleCenter />
+            </MainLayout>
+          </ProtectedRoute>
+        }
+      />
+      <Route
+        path="/ai-image"
+        element={
+          <ProtectedRoute>
+            <MainLayout>
+              <AIImageStudio />
             </MainLayout>
           </ProtectedRoute>
         }

@@ -43,6 +43,38 @@ def get_db():
         db.close()
 
 
+def _column_exists(conn, table: str, column: str) -> bool:
+    """列是否存在（走 information_schema，不靠 ALTER 抛异常判断）"""
+    row = conn.execute(
+        text(
+            "SELECT COUNT(*) FROM information_schema.COLUMNS "
+            "WHERE TABLE_SCHEMA = DATABASE() "
+            "AND TABLE_NAME = :t AND COLUMN_NAME = :c"
+        ),
+        {"t": table, "c": column},
+    ).scalar()
+    return bool(row)
+
+
+def _ensure_columns(conn, specs) -> None:
+    """幂等补列。specs = [(table, column, ddl_sql), ...]
+
+    先判定再 ALTER，把「已存在跳过 / 新增成功 / 真失败」分成三种日志。
+    原实现靠 try/except 兜「列已存在」，导致任何异常（例如列补丁里
+    text 被函数内 import 遮蔽引发的 UnboundLocalError）都被打印成
+    「添加字段失败（可能已存在）」，真实错误被掩盖。
+    """
+    for table, column, ddl in specs:
+        if _column_exists(conn, table, column):
+            print(f"字段已存在，跳过：{table}.{column}")
+            continue
+        try:
+            conn.execute(text(ddl))
+            print(f"字段已添加：{table}.{column}")
+        except Exception as e:  # noqa: BLE001
+            print(f"添加 {table}.{column} 字段失败: {e}")
+
+
 def init_db():
     """初始化数据库"""
     try:
@@ -91,29 +123,38 @@ def init_db():
             AdProductDaily, AdOptimizationSuggestion, AdExecutionLog
         )
         from models.ai_video_task import AIVideoTask
+        from models.ai_image_task import AIImageTask
+        from models.ai_image_layout import AIImageLayout
         from models.video_binding_request import VideoBindingRequest
-        
+
         # 创建所有表
         Base.metadata.create_all(bind=engine)
         
-        # 检查并添加缺失的字段
+        # 检查并添加缺失的字段（幂等：已存在则跳过，不再伪造「失败」日志）
         with engine.connect() as conn:
-            tables_to_check = ['product_sales']
-            for table in tables_to_check:
-                try:
-                    conn.execute(text(f'ALTER TABLE {table} ADD COLUMN deleted_at DATETIME NULL'))
-                except Exception as e:
-                    print(f"添加 {table}.deleted_at 字段失败（可能已存在）: {e}")
-            # 差评分析表新增部门板块分类字段
-            try:
-                conn.execute(text("ALTER TABLE review_analyses ADD COLUMN department VARCHAR(20) NULL COMMENT '问题板块:operations/purchasing/warehouse/design'"))
-            except Exception as e:
-                print(f"添加 review_analyses.department 字段失败（可能已存在）: {e}")
-            # 差评分析表新增多板块字段（逗号分隔，一条差评可属多个板块）
-            try:
-                conn.execute(text("ALTER TABLE review_analyses ADD COLUMN departments VARCHAR(100) NULL COMMENT '问题板块多选，逗号分隔:operations/purchasing/warehouse/design'"))
-            except Exception as e:
-                print(f"添加 review_analyses.departments 字段失败（可能已存在）: {e}")
+            _ensure_columns(conn, [
+                ("product_sales", "deleted_at",
+                 "ALTER TABLE product_sales ADD COLUMN deleted_at DATETIME NULL"),
+                # 差评分析表新增部门板块分类字段
+                ("review_analyses", "department",
+                 "ALTER TABLE review_analyses ADD COLUMN department VARCHAR(20) NULL "
+                 "COMMENT '问题板块:operations/purchasing/warehouse/design'"),
+                # 差评分析表新增多板块字段（逗号分隔，一条差评可属多个板块）
+                ("review_analyses", "departments",
+                 "ALTER TABLE review_analyses ADD COLUMN departments VARCHAR(100) NULL "
+                 "COMMENT '问题板块多选，逗号分隔:operations/purchasing/warehouse/design'"),
+                # A+ 版式素材：列表用缩略图（原图 1~2MB，240 张直接进列表会把首屏拖死）
+                ("ai_image_layouts", "thumb_url",
+                 "ALTER TABLE ai_image_layouts ADD COLUMN thumb_url VARCHAR(1000) NULL "
+                 "COMMENT '列表缩略图地址（TOS，<=480px，仅展示）'"),
+                # 库存快照海外仓字段（飞书多维表同步写入主行）
+                ("inventory_snapshots", "overseas_inventory",
+                 "ALTER TABLE inventory_snapshots ADD COLUMN overseas_inventory FLOAT NULL DEFAULT 0 "
+                 "COMMENT '海外仓可售库存'"),
+                ("inventory_snapshots", "overseas_max_age",
+                 "ALTER TABLE inventory_snapshots ADD COLUMN overseas_max_age FLOAT NULL "
+                 "COMMENT '海外仓最大库龄（天）'"),
+            ])
             conn.commit()
         
         print("数据库表结构创建成功")
@@ -314,17 +355,6 @@ def init_db():
             except Exception:
                 pass
 
-            # 库存快照表海外仓字段（飞书多维表同步写入主行，每次启动幂等执行）
-            try:
-                conn.execute(text("ALTER TABLE inventory_snapshots ADD COLUMN overseas_inventory FLOAT NULL DEFAULT 0 COMMENT '海外仓可售库存'"))
-                conn.commit()
-            except Exception:
-                pass
-            try:
-                conn.execute(text("ALTER TABLE inventory_snapshots ADD COLUMN overseas_max_age FLOAT NULL COMMENT '海外仓最大库龄（天）'"))
-                conn.commit()
-            except Exception:
-                pass
         print("scheduler_locks 和 product_selections 表创建成功")
         
     except Exception as e:
