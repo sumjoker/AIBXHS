@@ -133,6 +133,10 @@ interface InventoryItem {
   replenishment_status: string;
   summary_flag: string;
   local_inventory?: number;
+  /** 海外仓可售库存（飞书多维表同步，仅主行有值） */
+  overseas_inventory?: number;
+  /** 海外仓最大库龄（天） */
+  overseas_max_age?: number | null;
   inspection_quantity?: number;
   suggest_qty?: number;
   replenishment_reason?: string;
@@ -160,6 +164,14 @@ interface LocalInventorySummary {
   total_sku: number;
   total_quantity: number;
   latest_batch_date: string | null;
+}
+
+/** 海外仓同步结果汇总（/restock/overseas-summary） */
+interface OverseasInventorySummary {
+  total_sku: number;
+  total_qty: number;
+  latest_record_date: string | null;
+  last_synced_at: string | null;
 }
 
 // ==================== Helper Functions ====================
@@ -538,6 +550,11 @@ const InventoryBot: React.FC = () => {
   const [syncButtonLabel, setSyncButtonLabel] = useState("同步FBA在途");
   const [syncProgress, setSyncProgress] = useState(0);
   const [syncStep, setSyncStep] = useState("");
+  // --- 海外仓同步状态（飞书多维表 → 主行） ---
+  const [syncingOverseas, setSyncingOverseas] = useState(false);
+  const [overseasButtonLabel, setOverseasButtonLabel] = useState("同步海外仓");
+  const overseasPollingRef = useRef(false); // 是否已有一条轮询链在跑，避免并发轮询
+  const overseasMountedRef = useRef(true); // 组件是否仍然挂载，卸载后停止轮询
 
   // --- 补货计算状态（跨页面持久化） ---
   const [calculating, setCalculating] = useState(false);
@@ -660,6 +677,10 @@ const InventoryBot: React.FC = () => {
     useState<LocalInventorySummary | null>(null);
   const [localLoading, setLocalLoading] = useState(false);
 
+  // --- Overseas inventory states（飞书海外仓同步结果，用于跨页面展示上次同步结果） ---
+  const [overseasSummary, setOverseasSummary] =
+    useState<OverseasInventorySummary | null>(null);
+
   // --- Inspection editing states ---
   const [editingInspectionId, setEditingInspectionId] = useState<number | null>(
     null,
@@ -704,6 +725,7 @@ const InventoryBot: React.FC = () => {
       { key: "return_rate_30d", label: "30天退货率" },
       { key: "return_rate_60d", label: "60天退货率" },
       { key: "local_inventory", label: "本地仓" },
+      { key: "overseas_inventory", label: "海外仓" },
       { key: "daily_sales", label: "日均销量" },
       { key: "sales_7d", label: "7天销量" },
       { key: "sales_14d", label: "14天销量" },
@@ -778,6 +800,19 @@ const InventoryBot: React.FC = () => {
       console.error("获取本地仓库存汇总失败:", error);
     } finally {
       setLocalLoading(false);
+    }
+  }, []);
+
+  const fetchOverseasSummary = useCallback(async () => {
+    try {
+      const response = await inventoryApi.getOverseasSummary();
+      const data = response.data?.data || response.data;
+      if (data) {
+        setOverseasSummary(data);
+      }
+    } catch (error) {
+      // 未配置海外仓表时接口可能不可用，静默降级，不打扰用户
+      console.error("获取海外仓汇总失败:", error);
     }
   }, []);
 
@@ -1614,6 +1649,145 @@ const InventoryBot: React.FC = () => {
     }
   };
 
+  // ========== 海外仓同步（飞书多维表 → 数据库 → 主行） ==========
+  // 与 FBA 同步一致：任务在服务端后台线程跑，前端只轮询状态；
+  // 进行中的状态写入 localStorage，切页/刷新回来后自动恢复并继续轮询。
+
+  const OVERSEAS_SYNC_STATUS_KEY = "overseasSyncStatus";
+
+  const saveOverseasStatusToStorage = (status: any) => {
+    localStorage.setItem(
+      OVERSEAS_SYNC_STATUS_KEY,
+      JSON.stringify({ ...status, savedAt: Date.now() }),
+    );
+  };
+
+  const loadOverseasStatusFromStorage = () => {
+    const saved = localStorage.getItem(OVERSEAS_SYNC_STATUS_KEY);
+    if (!saved) return null;
+    try {
+      const status = JSON.parse(saved);
+      // 与 FBA 同步一致的 30 分钟有效期，避免恢复早已结束的任务
+      if (Date.now() - status.savedAt < 30 * 60 * 1000) return status;
+      localStorage.removeItem(OVERSEAS_SYNC_STATUS_KEY);
+    } catch (e) {
+      console.error("解析海外仓同步状态失败", e);
+    }
+    return null;
+  };
+
+  const refreshAfterOverseasSync = () => {
+    fetchInventoryList(
+      pagination.current || 1,
+      pagination.pageSize,
+      searchText,
+      tableRiskFilter,
+      accountFilter,
+      countryFilter,
+      sortField,
+      sortOrder,
+      holidayFilter,
+    );
+    fetchOverseasSummary();
+  };
+
+  const stopOverseasPolling = () => {
+    overseasPollingRef.current = false;
+    setSyncingOverseas(false);
+    setOverseasButtonLabel("同步海外仓");
+    localStorage.removeItem(OVERSEAS_SYNC_STATUS_KEY);
+  };
+
+  const pollOverseasStatus = async (attempt = 0) => {
+    // 组件已卸载（切走页面）就停掉本条轮询链，回来时靠 localStorage 恢复，
+    // 避免离开页面后仍持续请求后端
+    if (!overseasMountedRef.current) {
+      overseasPollingRef.current = false;
+      return;
+    }
+    // 最长轮询 20 分钟（与后端定时任务的等待上限一致），避免异常时无限轮询
+    const MAX_POLL = 800;
+    if (attempt > MAX_POLL) {
+      stopOverseasPolling();
+      messageApi.warning("海外仓同步耗时过长，已停止轮询，请稍后刷新查看结果");
+      return;
+    }
+    try {
+      const res = await inventoryApi.getSyncOverseasStatus();
+      const status = res.data?.data;
+      if (status?.is_running) {
+        saveOverseasStatusToStorage(status);
+        setSyncingOverseas(true);
+        setOverseasButtonLabel(`海外仓同步 ${status.progress || 0}%`);
+        setTimeout(() => pollOverseasStatus(attempt + 1), 1500);
+        return;
+      }
+      stopOverseasPolling();
+      if (status?.error) {
+        messageApi.error(`海外仓同步失败: ${status.error}`);
+      } else if (status?.skipped) {
+        // 源表数据比库中更旧（上游回退/补数），后端主动跳过，不应提示成功
+        messageApi.warning(status.step || "本次同步已跳过");
+      } else if (status?.progress === 100) {
+        messageApi.success(
+          status.step || `海外仓同步完成，写入 ${status.updated || 0} 个 SKU`,
+        );
+        refreshAfterOverseasSync();
+      }
+    } catch (error) {
+      stopOverseasPolling();
+      messageApi.error("获取海外仓同步状态失败");
+    }
+  };
+
+  /** 启动一条轮询链（同一时刻只允许一条，避免手动触发与恢复触发并发轮询） */
+  const startOverseasPolling = () => {
+    if (overseasPollingRef.current) return;
+    overseasPollingRef.current = true;
+    pollOverseasStatus(0);
+  };
+
+  const handleSyncOverseas = async () => {
+    setSyncingOverseas(true);
+    setOverseasButtonLabel("海外仓同步 0%");
+    try {
+      const res = await inventoryApi.syncOverseasInventory();
+      const data = res.data?.data;
+      if (data?.started) {
+        messageApi.success("海外仓同步任务已启动，请稍候...");
+        startOverseasPolling();
+      } else if (data?.reason === "running") {
+        // 已在运行（如 8:00 定时任务 / 其他标签页触发的任务）→ 接入轮询，不重复启动
+        messageApi.info("海外仓同步任务正在运行中，已接入进度显示");
+        startOverseasPolling();
+      } else {
+        messageApi.warning(data?.message || "海外仓同步未启动");
+        stopOverseasPolling();
+      }
+    } catch (error) {
+      messageApi.error("启动海外仓同步失败");
+      stopOverseasPolling();
+    }
+  };
+
+  // 进入页面时：恢复「进行中」的海外仓任务（含 8:00 定时任务）+ 拉取上次同步结果
+  useEffect(() => {
+    overseasMountedRef.current = true;
+    const saved = loadOverseasStatusFromStorage();
+    if (saved?.is_running) {
+      setSyncingOverseas(true);
+      setOverseasButtonLabel(`海外仓同步 ${saved.progress || 0}%`);
+      startOverseasPolling();
+    }
+    fetchOverseasSummary();
+    return () => {
+      // 切走页面：停掉轮询链（任务本身在服务端继续跑），回来时由 localStorage 恢复
+      overseasMountedRef.current = false;
+      overseasPollingRef.current = false;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   // 页面加载时检查是否有保存的同步状态
   useEffect(() => {
     const savedStatus = loadSyncStatusFromStorage();
@@ -2214,6 +2388,49 @@ const InventoryBot: React.FC = () => {
               <span
                 style={{
                   color: "#722ed1",
+                  fontWeight: 600,
+                  fontSize: 13,
+                }}
+              >
+                {formatNumber(qty)}
+              </span>
+            </Tooltip>
+          );
+        }
+        return <span style={{ color: "#ccc" }}>0</span>;
+      },
+    },
+    {
+      title: "海外仓",
+      dataIndex: "overseas_inventory",
+      key: "overseas_inventory",
+      width: 95,
+      align: "right",
+      sorter: true,
+      sortOrder:
+        sortField === "overseas_inventory"
+          ? sortOrder === "asc"
+            ? "ascend"
+            : "descend"
+          : undefined,
+      render: (val: number | undefined, record: InventoryItem) => {
+        if (record.summary_flag === "共享库存") {
+          return <span style={{ color: "#999" }}>-</span>;
+        }
+        const qty = val || 0;
+        const age = record.overseas_max_age;
+        const tip = [
+          "来自飞书多维表「海外仓」每日快照",
+          age !== null && age !== undefined ? `最大库龄：${age} 天` : null,
+        ]
+          .filter(Boolean)
+          .join("\n");
+        if (qty > 0) {
+          return (
+            <Tooltip title={<span style={{ whiteSpace: "pre-line" }}>{tip}</span>}>
+              <span
+                style={{
+                  color: "#08979c",
                   fontWeight: 600,
                   fontSize: 13,
                 }}
@@ -3160,6 +3377,30 @@ const InventoryBot: React.FC = () => {
             >
               数据日期: <b>{snapshotDate}</b>
             </span>
+          )}
+          {/* 海外仓上次同步结果：来自数据库，切页/重启后依然可见（每日 8:00 自动同步） */}
+          {overseasSummary && overseasSummary.total_sku > 0 && (
+            <Tooltip
+              title={
+                <span style={{ whiteSpace: "pre-line" }}>
+                  {`已同步 SKU：${overseasSummary.total_sku} 个\n可售合计：${overseasSummary.total_qty}\n源数据日期：${overseasSummary.latest_record_date || "-"}\n最后同步：${overseasSummary.last_synced_at || "-"}`}
+                </span>
+              }
+            >
+              <span
+                style={{
+                  color: "#08979c",
+                  fontSize: 13,
+                  background: "#e6fffb",
+                  border: "1px solid #b5f5ec",
+                  borderRadius: 4,
+                  padding: "3px 10px",
+                }}
+              >
+                海外仓: <b>{overseasSummary.total_sku}</b> 个 ·{" "}
+                {overseasSummary.latest_record_date?.slice(5) || "-"}
+              </span>
+            </Tooltip>
           )}
           <Button
             type="primary"
@@ -4115,6 +4356,15 @@ const InventoryBot: React.FC = () => {
           >
             {syncButtonLabel}
           </Button>
+          <Tooltip title="从飞书多维表拉取海外仓最新数据，按 SKU+品名 去重后覆盖写入，并回写到主行「海外仓」列">
+            <Button
+              icon={<Warehouse size={16} />}
+              onClick={handleSyncOverseas}
+              loading={syncingOverseas}
+            >
+              {overseasButtonLabel}
+            </Button>
+          </Tooltip>
           {/* 批量操作：作用于表格勾选的行（表头勾选=全选本页） */}
           <Button
             danger

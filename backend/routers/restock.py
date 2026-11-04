@@ -519,6 +519,61 @@ async def get_sync_feishu_status(
         raise HTTPException(status_code=500, detail=f"获取状态失败: {str(e)}")
 
 
+# ==================== 10.1 同步飞书海外仓库存数据 ====================
+
+@router.post("/sync-overseas")
+async def sync_overseas_inventory(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    启动飞书海外仓库存同步（异步）
+
+    同步规则：源表为按日快照，按 (SKU, SKU名称) 去重取最新日期后，
+    覆盖写入 overseas_inventories，并回写最新库存快照的主行。
+    """
+    try:
+        from services.overseas_inventory_service import start_sync_async
+
+        result = start_sync_async(tenant_id=current_user.tenant_id)
+        return {"success": True, "data": result}
+
+    except Exception as e:
+        logger.error(f"启动海外仓同步失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"启动失败: {str(e)}")
+
+
+@router.get("/sync-overseas-status")
+async def get_sync_overseas_status(
+    current_user: User = Depends(get_current_user)
+):
+    """获取飞书海外仓库存同步状态"""
+    try:
+        from services.overseas_inventory_service import get_sync_status
+
+        return {"success": True, "data": get_sync_status()}
+
+    except Exception as e:
+        logger.error(f"获取海外仓同步状态失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"获取状态失败: {str(e)}")
+
+
+@router.get("/overseas-summary")
+async def get_overseas_summary(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """海外仓库存汇总（已同步 SKU 数 / 总可售 / 数据日期）"""
+    try:
+        from services.overseas_inventory_service import get_overseas_summary as _summary
+
+        return {"success": True, "data": _summary(db, current_user.tenant_id)}
+
+    except Exception as e:
+        logger.error(f"获取海外仓汇总失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"获取汇总失败: {str(e)}")
+
+
 # ==================== 11. 更新查验货件数量 ====================
 
 @router.put("/inspection-quantity")

@@ -36,6 +36,11 @@ class Settings(BaseSettings):
     FEISHU_SYNC_APP_SECRET: str = ""
     FEISHU_SYNC_BASE_TOKEN: str = ""
     FEISHU_SYNC_TABLE_ID: str = ""
+    # 飞书多维表 - 海外仓库存表（复用 FBA 同步应用的 APP_ID/APP_SECRET，仅需另配表 ID）
+    FEISHU_OVERSEAS_BASE_TOKEN: str = ""
+    FEISHU_OVERSEAS_TABLE_ID: str = ""
+    # 海外仓库存每日自动同步时刻（小时，默认 8 点；与 FBA 同步共用后台任务与状态机）
+    OVERSEAS_SYNC_HOUR: int = 8
     # 飞书多维表 - AI视频首绑SKU上传表（产品首条视频绑定后可选直传SKU）
     FEISHU_VIDEO_BASE_TOKEN: str = ""
     FEISHU_VIDEO_TABLE_ID: str = ""
@@ -147,7 +152,11 @@ class Settings(BaseSettings):
             os.path.join(os.path.dirname(__file__), ".env"),
             os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env"),
         ],
-        "env_file_encoding": "utf-8",
+        # 必须用 utf-8-sig：.env 被记事本/Excel 编辑后常带 UTF-8 BOM，
+        # 用 "utf-8" 读会把首行键名变成 "\ufeffPORT"，导致该键静默失效
+        # 回落到默认值（2026-11-03 实测：PORT=8002 读不到，后端起在 8000，
+        # 前端 dev 代理指向 8002 → 登录全部失败）。utf-8-sig 对无 BOM 文件同样适用。
+        "env_file_encoding": "utf-8-sig",
         "extra": "ignore",
     }
 

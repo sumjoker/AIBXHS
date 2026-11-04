@@ -79,6 +79,9 @@ class InventorySnapshot(BaseModel):
 
     # 本地与总库存
     local_inventory = Column(Integer, default=0, comment="本地仓库存")
+    # 海外仓（飞书多维表同步，仅写在主行；子行不落值，避免展开后重复计数）
+    overseas_inventory = Column(Float, default=0, comment="海外仓可售库存")
+    overseas_max_age = Column(Float, comment="海外仓最大库龄（天）")
     inspection_quantity = Column(Integer, default=0, comment="查验货件数量")
     total_stock = Column(Float, comment="总库存")
 

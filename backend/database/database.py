@@ -82,6 +82,7 @@ def init_db():
         from models.threshold_setting import ThresholdSetting
         from models.restock import InventorySnapshot, InboundShipmentDetail, ReplenishmentDecision
         from models.local_inventory import LocalInventory
+        from models.overseas_inventory import OverseasInventory
         from models.inventory_management import PurchaseOrder, PurchaseOrderItem, InboundOrder, InboundOrderItem, OutboundOrder, OutboundOrderItem, InventoryBatch, OperationLog, StockTransferOrder, StockTransferOrderItem, Warehouse, ReplenishmentOrder, ReplenishmentItem, ShipmentOrder, ShipmentOrderItem
         from models.ad_campaign import AdCampaign, AdGroup, AdKeyword, AdTarget, AdProductAd, AdNegativeKeyword
         from models.ad_report import AdReportSnapshot, AdOptimizationRule, AdOptimizationLog
@@ -309,6 +310,18 @@ def init_db():
             # 页面优化机器人表品名字段（与库存快照表品名长度一致，每次启动幂等执行）
             try:
                 conn.execute(text("ALTER TABLE product_page_info MODIFY COLUMN product_name VARCHAR(500) NULL COMMENT '品名'"))
+                conn.commit()
+            except Exception:
+                pass
+
+            # 库存快照表海外仓字段（飞书多维表同步写入主行，每次启动幂等执行）
+            try:
+                conn.execute(text("ALTER TABLE inventory_snapshots ADD COLUMN overseas_inventory FLOAT NULL DEFAULT 0 COMMENT '海外仓可售库存'"))
+                conn.commit()
+            except Exception:
+                pass
+            try:
+                conn.execute(text("ALTER TABLE inventory_snapshots ADD COLUMN overseas_max_age FLOAT NULL COMMENT '海外仓最大库龄（天）'"))
                 conn.commit()
             except Exception:
                 pass

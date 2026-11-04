@@ -194,8 +194,79 @@ def init_scheduler():
         replace_existing=True
     )
 
+    # 海外仓库存每日自动同步（默认 8:00，可配置）。与 FBA 同步共用同一套后台线程 + 内存状态机，
+    # 因此定时触发与手动点击产生的是同一种任务，前端可实时看到同一份进度与结果。
+    _overseas_hour = get_settings().OVERSEAS_SYNC_HOUR
+    scheduler.add_job(
+        overseas_inventory_sync_job,
+        trigger="cron",
+        hour=_overseas_hour,
+        minute=0,
+        id="overseas_inventory_sync",
+        name="海外仓库存每日同步（飞书多维表）",
+        replace_existing=True,
+        misfire_grace_time=3600,   # 服务重启错过触发点时，1 小时内仍补跑一次
+        coalesce=True              # 多次错过只补跑一次
+    )
+
+    # 海外仓快照补写：库存快照按天新建行（新行海外仓默认为 0），
+    # 若当天导入发生在 8:00 同步之后，白天页面会显示全 0。
+    # 每小时做一次廉价自查（快照日期未变时只有 2 条 COUNT 查询），必要时按明细表回写主行。
+    scheduler.add_job(
+        overseas_backfill_job,
+        trigger=IntervalTrigger(minutes=60),
+        id="overseas_inventory_backfill",
+        name="海外仓库存快照补写（新快照自动回写主行）",
+        replace_existing=True
+    )
+
     scheduler.start()
     logger.info("定时任务调度器已启动")
+
+    # 启动补跑：服务在 8:00 之后才启动（或当天重启过）时，最近一次同步若早于「最近一个 8:00」，
+    # 延迟 60 秒补跑一次，避免用户上午打开页面看到的是昨天的海外仓数据。
+    try:
+        _schedule_overseas_catch_up()
+    except Exception as e:
+        logger.warning(f"海外仓启动补跑检查失败（不影响启动）: {e}")
+
+
+def _schedule_overseas_catch_up():
+    """启动时判断是否需要补跑当天的海外仓同步（只补一次，不影响定时任务本身）"""
+    from datetime import datetime, timedelta
+    from sqlalchemy import text
+    from config import get_settings
+    from database.database import SessionLocal
+
+    now = datetime.now()
+    boundary = now.replace(
+        hour=get_settings().OVERSEAS_SYNC_HOUR, minute=0, second=0, microsecond=0
+    )
+    if now < boundary:
+        # 今天 8:00 还没到 → 以昨天的 8:00 为基准
+        boundary = boundary - timedelta(days=1)
+
+    db = SessionLocal()
+    try:
+        last_synced = db.execute(
+            text("SELECT MAX(updated_at) FROM overseas_inventories WHERE tenant_id = 1")
+        ).scalar()
+    finally:
+        db.close()
+
+    if last_synced and last_synced >= boundary:
+        return
+
+    logger.info(
+        f"检测到海外仓最近一次同步为 {last_synced or '从未同步'}，早于 {boundary}，60 秒后补跑一次"
+    )
+    scheduler.add_job(
+        overseas_inventory_sync_job,
+        trigger="date",
+        run_date=datetime.now() + timedelta(seconds=60),
+        id="overseas_inventory_sync_catchup",
+        replace_existing=True,
+    )
 
 
 def startop_pull_job():
@@ -229,6 +300,113 @@ def startop_pull_job():
         logger.error(f"星拓拉取任务异常: {e}", exc_info=True)
     finally:
         release_distributed_lock(db, LOCK_KEY)
+        db.close()
+
+
+def overseas_inventory_sync_job():
+    """每日定时：飞书海外仓多维表 → overseas_inventories + 库存快照主行
+
+    与 FBA 同步完全一致的执行模型：
+      1. 起一个后台 daemon 线程跑同步（start_sync_async），不占用调度线程 IO；
+      2. 进度/结果写进程内状态机（get_sync_status），前端轮询同一个接口，
+         因此定时任务与手动点击在页面上表现一致（都能实时看到进度与结果）；
+      3. 页面切换不影响任务 —— 任务归属服务端进程，不归属 HTTP 请求/前端页面。
+
+    这里额外持有分布式锁并在锁内等待任务结束，避免多 worker/多进程重复跑；
+    正常一次约 5 秒，全量兜底扫描约 2 分钟，最长等待 20 分钟。
+    """
+    from database.database import SessionLocal
+    from services.overseas_inventory_service import (
+        get_sync_status,
+        is_configured,
+        start_sync_async,
+    )
+
+    LOCK_KEY = "overseas_inventory_sync"
+    MAX_WAIT_SECONDS = 20 * 60
+    db = SessionLocal()
+    try:
+        if not acquire_distributed_lock(db, LOCK_KEY, timeout_minutes=30):
+            logger.info("其他进程正在同步海外仓，本进程跳过")
+            return
+
+        if not is_configured():
+            logger.warning(
+                "海外仓定时同步跳过：未配置 FEISHU_OVERSEAS_BASE_TOKEN / FEISHU_OVERSEAS_TABLE_ID"
+            )
+            return
+
+        if get_sync_status().get("is_running"):
+            logger.info("海外仓同步任务已在运行（手动触发中），本次定时任务跳过")
+            return
+
+        logger.info("========== 开始海外仓每日定时同步 ==========")
+        result = start_sync_async(tenant_id=1)
+        if not result.get("started"):
+            logger.warning(f"海外仓定时同步未启动: {result.get('message')}")
+            return
+
+        # 等待后台线程结束，保证锁在整个同步期间有效
+        waited = 0
+        last_step = ""
+        while waited < MAX_WAIT_SECONDS:
+            status = get_sync_status()
+            step = status.get("step") or ""
+            if step != last_step:
+                logger.info(f"海外仓同步进度 {status.get('progress')}% - {step}")
+                last_step = step
+            if not status.get("is_running"):
+                break
+            time.sleep(2)
+            waited += 2
+
+        status = get_sync_status()
+        if status.get("error"):
+            logger.error(f"海外仓定时同步失败: {status.get('error')}")
+        elif status.get("skipped"):
+            logger.warning(f"海外仓定时同步被跳过: {status.get('step')}")
+        elif status.get("is_running"):
+            logger.warning(f"海外仓定时同步超过 {MAX_WAIT_SECONDS}s 仍未结束，停止等待（任务仍在后台运行）")
+        else:
+            logger.info(
+                "海外仓定时同步完成: 源数据日期=%s, SKU=%s, 主行写入=%s, 快照日期=%s",
+                status.get("source_date"), status.get("updated"),
+                status.get("matched"), status.get("snapshot_date"),
+            )
+    except Exception as e:
+        logger.error(f"海外仓定时同步任务异常: {e}", exc_info=True)
+    finally:
+        release_distributed_lock(db, LOCK_KEY)
+        db.close()
+
+
+def overseas_backfill_job():
+    """每小时自查：新一天的库存快照导入后，把海外仓值补写到该快照的主行
+
+    与同步任务解耦：不抓飞书、只用库内 overseas_inventories 做一次 JOIN 回写，
+    因此没有新快照时成本仅为 2 条 COUNT 查询，也不会与同步任务互相干扰。
+    """
+    from database.database import SessionLocal
+    from services.overseas_inventory_service import (
+        ensure_latest_snapshot_backfilled,
+        get_sync_status,
+        is_configured,
+    )
+
+    if not is_configured():
+        return
+    if get_sync_status().get("is_running"):
+        # 同步任务正在写主行，跳过本次自查，避免无意义的重复回写
+        return
+
+    db = SessionLocal()
+    try:
+        matched = ensure_latest_snapshot_backfilled(db, tenant_id=1)
+        if matched is not None:
+            logger.info(f"检测到新库存快照，海外仓已补写主行 {matched} 行")
+    except Exception as e:
+        logger.warning(f"海外仓快照补写失败（不影响主流程）: {e}")
+    finally:
         db.close()
 
 

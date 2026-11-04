@@ -1616,6 +1616,9 @@ def search_inventory(db: Session, tenant_id: int, keyword: str = None, risk_leve
             "risk_level": risk_map_r.get(dec.risk_level, "green") if dec else "green",
             "summary_flag": snap.summary_flag,
             "local_inventory": local_qty,
+            # 海外仓库存：飞书多维表按 (SKU, 品名) 回写到主行，子行恒为 0
+            "overseas_inventory": snap.overseas_inventory or 0,
+            "overseas_max_age": snap.overseas_max_age,
             "suggest_qty": int(dec.suggest_qty) if dec else 0,
             "replenishment_reason": dec.reason if dec else "",
             "inspection_quantity": snap.inspection_quantity or 0,

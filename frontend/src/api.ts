@@ -156,6 +156,10 @@ export const inventoryApi = {
   },
   syncFeishuInbound: () => apiClient.post("/restock/sync-feishu-inbound"),
   getSyncFeishuStatus: () => apiClient.get("/restock/sync-feishu-status"),
+  // 海外仓：飞书多维表 → 数据库（按 SKU+品名 去重覆盖，回写主行）
+  syncOverseasInventory: () => apiClient.post("/restock/sync-overseas"),
+  getSyncOverseasStatus: () => apiClient.get("/restock/sync-overseas-status"),
+  getOverseasSummary: () => apiClient.get("/restock/overseas-summary"),
   updateInspectionQuantity: (snapshotId: number, quantity: number) =>
     apiClient.put("/restock/inspection-quantity", null, {
       params: { snapshot_id: snapshotId, inspection_quantity: quantity },
