@@ -6,6 +6,20 @@
 
 ## 2026-11-04
 
+### [后端+前端] 风险整改：导入性能、导出字段、仓库清理、部署健壮性
+- **操作**：按体检结论处理确认项（按要求暂不处理「海外仓展示口径」与「补跑库存导入」）
+- **导入性能（业务等价）**：`fba_inbound` 校验由「`for sid in all_sids` 逐行 2 条 SQL」改为一条 JOIN UPDATE
+  - 覆盖范围（本批次在途快照 all_sids）与判定条件（`old != sum`）保持完全一致
+  - 实测 200 条样本：逐行版与集合式结果 **0 差异**；2833 个有明细的快照配合 ≈5666 次往返降为 1 次
+- **导出**：新增「海外仓库存」列（`inventory_service.all_fields` + 前端导出字段选项），已用 openpyxl 验证表头与数值
+- **仓库清理**：移除合并带入的调试残留 `_pi_*.txt`、`fc_err.txt`、`fc_out.txt`、`_analysis_ref.json`、`frontend/build_exit.txt`、`frontend/build_log.txt`
+- **部署健壮性**：
+  - 新增 `OVERSEAS_SYNC_TENANT_ID`（默认 1），定时同步 / 启动补跑 / 快照补写统一读取
+  - `init_db()` 启动时只读校验 `ai_image:use` 权限，缺失则告警提示执行 `migrations/add_ai_image_permission.py`（不自动授权，避免动权限矩阵）
+  - **前端产物已重新构建并部署到 `backend/static`**（旧入口备份 `index.html.bak_20261104_150322`），线上已可看到海外仓列
+- **澄清**：此前列为 P0 的「4 行在途不一致」经查为**上游数据问题**（Excel「FBA在途」列有值、`FBA在途详情` 文本为空），非代码缺陷，**未改动数据**
+- **涉及文件**：`backend/services/inventory_import_service.py`、`backend/services/inventory_service.py`、`backend/services/scheduler.py`、`backend/database/database.py`、`backend/config.py`、`backend/.env.example`、`frontend/src/pages/InventoryBot.tsx`
+
 ### [前端] 修复「在途详情」在途为 0 仍可点击（该修复在 inventory-optimize 分支丢失）
 - **操作**：恢复「在途=0 时按钮置灰不可点 + 悬停提示『无在途货件』」
 - **根因**：该修复由 `541f01e`（feat/ai-image-gen 检查点提交，2026-10-27）引入，但只存在于 `feat/ai-image-gen` / `backup/img-20261027` 分支，`inventory-optimize` 的 HEAD 未包含该改动
