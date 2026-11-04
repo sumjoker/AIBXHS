@@ -2761,27 +2761,19 @@ const InventoryBot: React.FC = () => {
         };
         return (
           <Space size={4} style={{ flexWrap: "nowrap", whiteSpace: "nowrap" }}>
-            {/* 在途为 0 时无货件可查：按钮置灰不可点，并给出「无在途货件」提示。
-                antd v5 的 Tooltip 不会自动包裹 disabled 子元素（浏览器不给 disabled 控件派发鼠标事件），
-                因此这里用 span 承接 hover，按钮本身 pointer-events:none，保证提示始终可见。 */}
+            {/* 与线上版本保持一字不差的实现：Tooltip + disabled（541f01e）。
+                不要额外加 pointer-events:none / span 包一层 —— 那会让「置灰后鼠标悬浮没有高亮反馈」，
+                与线上观感不一致。 */}
             <Tooltip title={noInbound ? "无在途货件" : ""}>
-              <span
-                style={{
-                  display: "inline-block",
-                  cursor: noInbound ? "not-allowed" : "default",
-                }}
+              <Button
+                type="link"
+                size="small"
+                icon={<Truck size={14} />}
+                disabled={noInbound}
+                onClick={() => handleViewInbound(record.asin, record.account)}
               >
-                <Button
-                  type="link"
-                  size="small"
-                  icon={<Truck size={14} />}
-                  disabled={noInbound}
-                  style={noInbound ? { pointerEvents: "none" } : undefined}
-                  onClick={() => handleViewInbound(record.asin, record.account)}
-                >
-                  在途详情
-                </Button>
-              </span>
+                在途详情
+              </Button>
             </Tooltip>
             {record.force_replenish === 1 ? (
               // 与「强制补货」按钮同结构（icon + 4 字），保证两态等宽 —— 否则第 3 槽
