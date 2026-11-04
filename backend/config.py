@@ -225,5 +225,40 @@ class Settings(BaseSettings):
     }
 
 
+_ENV_WARNED = False
+
+
+def _warn_env_port_mismatch(settings: "Settings") -> None:
+    """显式校验 .env 里的 PORT 是否真的生效（只提示一次）
+
+    背景：.env 被 PowerShell Set-Content / 记事本等工具重复写入 BOM 时，
+    首行键名会变成 "\\ufeff\\ufeffPORT"，pydantic 的 utf-8-sig 只能去掉一个 BOM，
+    剩下的那个让该键静默失效并回落到默认值 —— 表现为「配置写 8002，后端起在 8000」。
+    这里把这种无声错配变成一条显式告警。
+    """
+    global _ENV_WARNED
+    if _ENV_WARNED:
+        return
+    _ENV_WARNED = True
+    try:
+        import re as _re
+
+        env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+        if not os.path.isfile(env_path):
+            return
+        with open(env_path, "rb") as fp:
+            text = fp.read().decode("utf-8", "ignore").lstrip("\ufeff")
+        m = _re.search(r"^\s*PORT\s*=\s*(\d+)", text, _re.M)
+        if m and int(m.group(1)) != settings.PORT:
+            print(
+                f"⚠ backend/.env 中 PORT={m.group(1)}，但实际生效 {settings.PORT}；"
+                f"该文件可能带重复 BOM 或编码异常，请用「UTF-8 无 BOM」保存后重启"
+            )
+    except Exception:
+        pass
+
+
 def get_settings() -> Settings:
-    return Settings()
+    settings = Settings()
+    _warn_env_port_mismatch(settings)
+    return settings
