@@ -41,6 +41,8 @@ class Settings(BaseSettings):
     FEISHU_OVERSEAS_TABLE_ID: str = ""
     # 海外仓库存每日自动同步时刻（小时，默认 8 点；与 FBA 同步共用后台任务与状态机）
     OVERSEAS_SYNC_HOUR: int = 8
+    # 海外仓定时同步写入的租户（单租户部署保持 1；多租户可按需改成对应租户 ID）
+    OVERSEAS_SYNC_TENANT_ID: int = 1
     # 飞书多维表 - AI视频首绑SKU上传表（产品首条视频绑定后可选直传SKU）
     FEISHU_VIDEO_BASE_TOKEN: str = ""
     FEISHU_VIDEO_TABLE_ID: str = ""

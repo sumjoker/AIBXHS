@@ -249,7 +249,8 @@ def _schedule_overseas_catch_up():
     db = SessionLocal()
     try:
         last_synced = db.execute(
-            text("SELECT MAX(updated_at) FROM overseas_inventories WHERE tenant_id = 1")
+            text("SELECT MAX(updated_at) FROM overseas_inventories WHERE tenant_id = :tid"),
+            {"tid": get_settings().OVERSEAS_SYNC_TENANT_ID},
         ).scalar()
     finally:
         db.close()
@@ -341,7 +342,8 @@ def overseas_inventory_sync_job():
             return
 
         logger.info("========== 开始海外仓每日定时同步 ==========")
-        result = start_sync_async(tenant_id=1)
+        from config import get_settings
+        result = start_sync_async(tenant_id=get_settings().OVERSEAS_SYNC_TENANT_ID)
         if not result.get("started"):
             logger.warning(f"海外仓定时同步未启动: {result.get('message')}")
             return
@@ -399,9 +401,11 @@ def overseas_backfill_job():
         # 同步任务正在写主行，跳过本次自查，避免无意义的重复回写
         return
 
+    from config import get_settings
+
     db = SessionLocal()
     try:
-        matched = ensure_latest_snapshot_backfilled(db, tenant_id=1)
+        matched = ensure_latest_snapshot_backfilled(db, tenant_id=get_settings().OVERSEAS_SYNC_TENANT_ID)
         if matched is not None:
             logger.info(f"检测到新库存快照，海外仓已补写主行 {matched} 行")
     except Exception as e:

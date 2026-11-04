@@ -158,6 +158,19 @@ def init_db():
             conn.commit()
         
         print("数据库表结构创建成功")
+
+        # 权限种子自查：AI 生图接口全部依赖 ai_image:use（由 migrations/add_ai_image_permission.py 写入）。
+        # 这里只做只读检查 + 告警，不自动授权，避免动到既有权限矩阵。
+        try:
+            with engine.connect() as conn:
+                _has_perm = conn.execute(text(
+                    "SELECT COUNT(*) FROM permissions WHERE code = 'ai_image:use' AND deleted_at IS NULL"
+                )).scalar()
+            if not _has_perm:
+                print("⚠ 未找到权限 ai_image:use，AI 生图页面会返回 403；"
+                      "请在目标库执行 backend/migrations/add_ai_image_permission.py")
+        except Exception as _perm_err:
+            print(f"权限种子自查跳过（权限表可能尚未创建）: {_perm_err}")
         
         # 手动创建 scheduler_locks 和 product_selections 表
         # 注意：text 已在模块顶部导入；函数内再 import 会使 text 变成本地变量，
