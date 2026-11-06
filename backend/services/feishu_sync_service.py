@@ -10,9 +10,12 @@ from datetime import datetime, date, timedelta
 from typing import Optional
 from sqlalchemy.orm import Session
 from sqlalchemy import text
+import logging
 import threading
 import time
 import concurrent.futures
+
+logger = logging.getLogger(__name__)
 
 # 飞书应用配置（从 .env 读取，避免在业务代码中暴露）
 from config import get_settings
@@ -178,10 +181,11 @@ def get_sync_status() -> dict:
 def _do_sync():
     """后台同步任务"""
     global _sync_status
-    
+
     from database.database import SessionLocal
     db = SessionLocal()
-    
+    sync_ok = False  # 仅「正常结束」（含飞书返回 0 条）才置 True，收尾据此决定是否发补填通知
+
     try:
         # 初始化状态
         _sync_status = {
@@ -193,47 +197,48 @@ def _do_sync():
             "finished_at": None,
             "step": "获取飞书数据..."
         }
-        
+
         # 步骤1: 获取飞书数据
         t0 = time.time()
         feishu_data = fetch_feishu_inbound_data_fast(days=90)
         _sync_status["total"] = len(feishu_data)
         _sync_status["step"] = f"获取到 {len(feishu_data)} 条飞书数据"
-        
+
         if not feishu_data:
-            _sync_status["is_running"] = False
+            # 飞书返回 0 条同样属于「正常结束」：此时字段仍可能缺失，需要走补填通知
             _sync_status["step"] = "没有需要同步的数据"
+            sync_ok = True
             return
-        
+
         # 步骤2: 批量UPDATE
         _sync_status["step"] = "更新数据库..."
         _sync_status["progress"] = 30
-        
+
         batch_size = 500
         total_updated = 0
-        
+
         for i in range(0, len(feishu_data), batch_size):
             batch = feishu_data[i:i + batch_size]
-            
+
             transport_cases = []
             eta_cases = []
             ship_date_cases = []
             shipment_ids = []
-            
+
             for item in batch:
                 sid = item["shipment_id"].replace("'", "''")
                 tm = item["transport_method"].replace("'", "''")
                 eta = f"'{item['estimated_arrival_date']}'" if item["estimated_arrival_date"] else "NULL"
                 sd = f"'{item['ship_date']}'" if item.get("ship_date") else "NULL"
-                
+
                 shipment_ids.append(f"'{sid}'")
                 transport_cases.append(f"WHEN '{sid}' THEN '{tm}'")
                 eta_cases.append(f"WHEN '{sid}' THEN {eta}")
                 ship_date_cases.append(f"WHEN '{sid}' THEN {sd}")
-            
+
             sql = f"""
                 UPDATE inbound_shipment_details
-                SET 
+                SET
                     transport_method = CASE shipment_id {chr(10).join(transport_cases)} END,
                     estimated_arrival_date = CASE shipment_id {chr(10).join(eta_cases)} END,
                     ship_date = CASE shipment_id {chr(10).join(ship_date_cases)} END,
@@ -243,25 +248,36 @@ def _do_sync():
             result = db.execute(text(sql))
             db.commit()
             total_updated += result.rowcount
-            
+
             progress = 30 + int((i + batch_size) / len(feishu_data) * 60)
             _sync_status["progress"] = min(progress, 90)
             _sync_status["step"] = f"更新数据库 {min(i + batch_size, len(feishu_data))}/{len(feishu_data)}"
-        
+
         # 完成
-        _sync_status["is_running"] = False
         _sync_status["updated"] = total_updated
         _sync_status["progress"] = 100
         _sync_status["step"] = f"同步完成！更新 {total_updated} 条记录"
         _sync_status["finished_at"] = datetime.now().isoformat()
-        
+        sync_ok = True
+
     except Exception as e:
-        _sync_status["is_running"] = False
         _sync_status["error"] = str(e)
         _sync_status["step"] = f"同步失败: {str(e)}"
         import traceback
         traceback.print_exc()
     finally:
+        # 收尾顺序（coding 文档 §4.2 硬约束）：
+        #   1) 正常结束时先发「FBA 补填通知」（任何失败只记日志，不允许抛出）；
+        #   2) 之后才置 is_running=False —— 否则导入子进程 _wait_sync_finish 立即返回、
+        #      子进程退出会强杀本 daemon 线程，通知一起丢失；
+        #   3) 最后关闭连接。
+        if sync_ok:
+            try:
+                from services.fba_inbound_fill_notifier import notify_missing_fba_info
+                logger.info("FBA在途补填通知: %s", notify_missing_fba_info())
+            except Exception as e:
+                logger.warning("FBA在途补填通知失败（不阻塞同步）: %s", e)
+        _sync_status["is_running"] = False
         db.close()
 
 
